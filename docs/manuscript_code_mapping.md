@@ -37,6 +37,15 @@ shape, threshold policy, frozen ID rule, and feature contribution outputs.
 | Freeze reconstruction threshold from training/validation errors | `scripts/train_manuscript_autoencoder.py`, `src/telemetry_anomaly/autoencoder.py` |
 | Apply frozen row flags and animal-level count/fraction rule | `scripts/apply_manuscript_frozen_rule.py` |
 | Export per-feature residual contribution percentages | `scripts/manuscript_feature_contributions.py` |
+| Generate manuscript-shaped synthetic CSV inputs for demos | `scripts/generate_manuscript_synthetic_inputs.py` |
+
+## Manuscript Script Families
+
+| Study family | Public profile | Main public scripts |
+| --- | --- | --- |
+| Mule deer manuscript pipeline | `mule_60_40` | `prepare_manuscript_features.py`, `train_manuscript_autoencoder.py`, `apply_manuscript_frozen_rule.py`, `manuscript_feature_contributions.py` |
+| White-tailed deer primary pipeline | `wtd_primary` | `prepare_manuscript_features.py`, `train_manuscript_autoencoder.py`, `apply_manuscript_frozen_rule.py`, `manuscript_feature_contributions.py` |
+| White-tailed deer six-hour / 4-pings pipeline | `wtd_four_pings` | `prepare_manuscript_features.py`, `train_manuscript_autoencoder.py`, `apply_manuscript_frozen_rule.py`, `manuscript_feature_contributions.py` |
 
 ## Profile Defaults
 
@@ -69,14 +78,22 @@ Generate public-safe sample telemetry:
 python scripts/generate_sample_data.py
 ```
 
+Generate manuscript-shaped synthetic inputs:
+
+```bash
+python scripts/generate_manuscript_synthetic_inputs.py \
+  --profile wtd_primary \
+  --output-dir data/sample/manuscript_synthetic
+```
+
 Run the manuscript-profile TensorFlow autoencoder pipeline:
 
 ```bash
 pip install ".[deep-learning]"
 python scripts/prepare_manuscript_features.py \
   --profile wtd_primary \
-  --train-csv path/to/CWD_negative_training_with_seasons2.csv \
-  --test-csv path/to/CWD_positive_testing_with_seasons2.csv \
+  --train-csv data/sample/manuscript_synthetic/wtd_primary_train.csv \
+  --test-csv data/sample/manuscript_synthetic/wtd_primary_test.csv \
   --output-dir outputs/wtd_primary
 
 python scripts/train_manuscript_autoencoder.py \
