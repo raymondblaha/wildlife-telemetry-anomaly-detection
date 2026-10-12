@@ -69,7 +69,7 @@ def contribution_percent(residual_sq: np.ndarray, mask: np.ndarray) -> np.ndarra
 def fit_dashboard_autoencoder(
     df: pd.DataFrame,
     threshold_percentile: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int | str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float | int | str]]:
     """Train a lightweight reconstruction model and score all selected telemetry rows."""
 
     out = df.copy()
@@ -111,6 +111,7 @@ def fit_dashboard_autoencoder(
     threshold = float(np.nanpercentile(val_error, threshold_percentile))
     out["reconstruction_error"] = residual_sq.sum(axis=1)
     out["is_anomaly"] = out["reconstruction_error"] >= threshold
+    out["threshold_percentile"] = threshold_percentile
 
     flagged_mask = out["is_anomaly"].to_numpy(bool)
     comparison_mask = out["label"].eq(1).to_numpy(bool)
@@ -129,6 +130,22 @@ def fit_dashboard_autoencoder(
     y_true = out["label"].astype(int).to_numpy()
     y_pred = out["is_anomaly"].astype(int).to_numpy()
     metrics = row_level_metrics(y_true, y_pred)
+    sweep_rows = []
+    for percentile in range(80, 100):
+        sweep_threshold = float(np.nanpercentile(val_error, percentile))
+        sweep_pred = out["reconstruction_error"].ge(sweep_threshold).astype(int).to_numpy()
+        sweep_metrics = row_level_metrics(y_true, sweep_pred)
+        sweep_rows.append(
+            {
+                "percentile": percentile,
+                "threshold": sweep_threshold,
+                "flagged_fix_rate": float(sweep_pred.mean()),
+                "sensitivity": sweep_metrics["sensitivity_recall"],
+                "specificity": sweep_metrics["specificity"],
+                "balanced_accuracy": sweep_metrics["balanced_accuracy"],
+            }
+        )
+    threshold_sweep = pd.DataFrame(sweep_rows)
     metrics.update(
         {
             "threshold": threshold,
@@ -142,7 +159,7 @@ def fit_dashboard_autoencoder(
             "latent_width": 4,
         }
     )
-    return out, contribution, metrics
+    return out, contribution, threshold_sweep, metrics
 
 
 def main() -> None:
@@ -172,8 +189,30 @@ def main() -> None:
             sorted(df["genotype"].unique()),
             default=sorted(df["genotype"].unique()),
         )
-        threshold_percentile = st.slider("Reference validation threshold percentile", 80, 99, 95)
-        min_anomalous_fixes = st.slider("Animal flag rule: minimum anomalous fixes", 1, 20, 3)
+        st.header("Model Controls")
+        threshold_percentile = st.slider(
+            "Reference validation threshold percentile",
+            80,
+            99,
+            95,
+            help=(
+                "Higher values make row-level anomaly calls stricter. This moves the threshold "
+                "line and changes the flagged fix rate."
+            ),
+        )
+        min_anomalous_fixes = st.slider(
+            "Animal flag rule: minimum anomalous fixes",
+            1,
+            20,
+            3,
+            help=(
+                "An animal is called anomalous only when at least this many of its GPS fixes "
+                "are above the reconstruction-error threshold."
+            ),
+        )
+        st.caption(
+            "Threshold percentile controls row flags; minimum fixes controls animal-level calls."
+        )
 
     filtered = df[
         df["species"].isin(species)
@@ -185,7 +224,7 @@ def main() -> None:
         st.stop()
 
     try:
-        scored, feature_contribution, model_metrics = fit_dashboard_autoencoder(
+        scored, feature_contribution, threshold_sweep, model_metrics = fit_dashboard_autoencoder(
             filtered,
             threshold_percentile,
         )
@@ -200,18 +239,43 @@ def main() -> None:
         "autoencoders with protected telemetry data."
     )
 
-    animals = scored["animal_id"].nunique()
     fixes = len(scored)
     anomalous_rate = scored["is_anomaly"].mean()
     reference_animals = scored.loc[scored["label"] == 0, "animal_id"].nunique()
     comparison_animals = scored.loc[scored["label"] == 1, "animal_id"].nunique()
+    animal_flags = animal_level_flags(
+        scored,
+        animal_col="animal_id",
+        label_col="label",
+        flag_col="is_anomaly",
+        min_anomalous_fixes=min_anomalous_fixes,
+    )
+    animal_flags = animal_flags.merge(
+        scored[["animal_id", "species", "sex", "genotype"]].drop_duplicates(),
+        on="animal_id",
+        how="left",
+    )
+    animal_flags["anomalous_fix_rate"] = (
+        animal_flags["n_anomalous_fixes"] / animal_flags["n_fixes"]
+    )
+    animal_flags["predicted_status"] = np.where(
+        animal_flags["predicted_label"].eq(1),
+        "flagged animal",
+        "not flagged",
+    )
+    animal_metrics = row_level_metrics(
+        animal_flags["true_label"].astype(int).to_numpy(),
+        animal_flags["predicted_label"].astype(int).to_numpy(),
+    )
+    animals_flagged = int(animal_flags["predicted_label"].sum())
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Reference Animals", f"{reference_animals:,}")
     c2.metric("Comparison Animals", f"{comparison_animals:,}")
     c3.metric("GPS Fixes", f"{fixes:,}")
     c4.metric("Anomaly Threshold", f"{model_metrics['threshold']:.3f}")
     c5.metric("Flagged Fix Rate", f"{anomalous_rate:.1%}")
+    c6.metric("Animals Flagged", f"{animals_flagged}/{len(animal_flags)}")
 
     tab_model, tab_animals, tab_contributions, tab_quality, tab_methods = st.tabs(
         [
@@ -258,9 +322,26 @@ def main() -> None:
             x=model_metrics["threshold"],
             line_dash="dash",
             line_color="red",
-            annotation_text="reference validation threshold",
+            annotation_text=f"{threshold_percentile}th pct threshold",
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        sweep_fig = px.line(
+            threshold_sweep,
+            x="percentile",
+            y=["flagged_fix_rate", "balanced_accuracy", "sensitivity", "specificity"],
+            markers=True,
+            title="Threshold Slider Sensitivity",
+            labels={"value": "metric value", "percentile": "reference validation percentile"},
+        )
+        sweep_fig.add_vline(
+            x=threshold_percentile,
+            line_dash="dash",
+            line_color="red",
+            annotation_text="current slider",
+        )
+        sweep_fig.update_yaxes(tickformat=".0%")
+        st.plotly_chart(sweep_fig, use_container_width=True)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sensitivity", f"{model_metrics['sensitivity_recall']:.2f}")
@@ -286,29 +367,30 @@ def main() -> None:
 
     with tab_animals:
         st.subheader("Animal-Level Flags")
-        animal_flags = animal_level_flags(
-            scored,
-            animal_col="animal_id",
-            label_col="label",
-            flag_col="is_anomaly",
-            min_anomalous_fixes=min_anomalous_fixes,
+        st.write(
+            f"Current rule: an animal is flagged when it has at least "
+            f"{min_anomalous_fixes} anomalous GPS fixes."
         )
-        animal_flags = animal_flags.merge(
-            scored[["animal_id", "species", "sex", "genotype"]].drop_duplicates(),
-            on="animal_id",
-            how="left",
-        )
-        animal_flags["anomalous_fix_rate"] = (
-            animal_flags["n_anomalous_fixes"] / animal_flags["n_fixes"]
-        )
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Animals Flagged", f"{animals_flagged}/{len(animal_flags)}")
+        a2.metric("Animal Sensitivity", f"{animal_metrics['sensitivity_recall']:.2f}")
+        a3.metric("Animal Specificity", f"{animal_metrics['specificity']:.2f}")
+        a4.metric("Animal Balanced Accuracy", f"{animal_metrics['balanced_accuracy']:.2f}")
 
         fig = px.bar(
             animal_flags.sort_values("n_anomalous_fixes", ascending=False),
             x="animal_id",
             y="n_anomalous_fixes",
-            color="true_label",
-            title="Anomalous Fixes per Synthetic Animal",
-            labels={"true_label": "synthetic label"},
+            color="predicted_status",
+            title="Animal-Level Calls Driven by the Minimum-Fixes Slider",
+            labels={"predicted_status": "animal call"},
+        )
+        fig.add_hline(
+            y=min_anomalous_fixes,
+            line_dash="dash",
+            line_color="red",
+            annotation_text="animal flag rule",
         )
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(animal_flags, use_container_width=True)
