@@ -49,7 +49,7 @@ the reproducible engineering and analysis patterns behind the work.
 - A dashboard layer for inspecting autoencoder-style reconstruction error, feature residual
   contributions, and animal-level anomaly calls using synthetic data.
 
-## Manuscript-Profile Pipeline
+## Actual Manuscript Scripts
 
 The manuscript-profile scripts are the closest public-safe representation of the paper
 workflow. They preserve the notebook decisions that matter for scientific review:
@@ -66,14 +66,27 @@ workflow. They preserve the notebook decisions that matter for scientific review
 - Frozen animal-level rules: WTD primary `COUNT=550`, WTD six-hour `COUNT=110`, mule deer
   60:40 `COUNT=75`, all with `FRAC=0.75` and `OR` aggregation.
 
-Example WTD primary run:
+The core scripts are:
+
+| Step | Script | What it preserves from the notebooks |
+| --- | --- | --- |
+| 1 | `scripts/prepare_manuscript_features.py` | train-only scaler/encoder fitting, ID-disjoint validation split, frozen feature order |
+| 2 | `scripts/train_manuscript_autoencoder.py` | TensorFlow/Keras AE, `32 -> 16 -> 4 -> 16 -> 32`, scaled MSE, checkpointing |
+| 3 | `scripts/apply_manuscript_frozen_rule.py` | frozen row threshold and animal-level count/fraction rule |
+| 4 | `scripts/manuscript_feature_contributions.py` | squared-residual feature contribution tables |
+
+To create a local public-safe artifact run with manuscript-shaped synthetic data:
 
 ```bash
+python scripts/generate_manuscript_synthetic_inputs.py \
+  --profile wtd_primary \
+  --output-dir data/sample/manuscript_synthetic
+
 pip install ".[deep-learning]"
 python scripts/prepare_manuscript_features.py \
   --profile wtd_primary \
-  --train-csv path/to/CWD_negative_training_with_seasons2.csv \
-  --test-csv path/to/CWD_positive_testing_with_seasons2.csv \
+  --train-csv data/sample/manuscript_synthetic/wtd_primary_train.csv \
+  --test-csv data/sample/manuscript_synthetic/wtd_primary_test.csv \
   --output-dir outputs/wtd_primary
 
 python scripts/train_manuscript_autoencoder.py \
@@ -104,32 +117,31 @@ Supported profiles are `wtd_primary`, `wtd_four_pings`, and `mule_60_40`.
 8. Evaluate on held-out animals and report both row-level and animal-level results.
 9. Summarize feature-level squared residual contributions for model interpretation.
 
-## Public-Safe Analysis Dashboard
+## Reduced Dashboard
 
 The Streamlit dashboard is a supporting inspection layer, not the centerpiece of the
-project. It uses synthetic telemetry to demonstrate how the ML workflow can be audited and
-communicated without exposing protected wildlife locations or unpublished animal labels.
+project. It is designed to load saved local artifacts from the manuscript scripts first:
+processed CSVs, `feature_columns_*.pkl`, `reconstruction_threshold.pkl`, `id_rule_params.pkl`,
+training history, model weights, row flags, ID summaries, and feature contribution tables.
 
 It is designed to show:
 
-- a lightweight autoencoder-style reconstruction model trained on synthetic reference
-  animals;
-- reconstruction-error scoring and frozen validation-threshold behavior;
-- feature residual contribution percentages, mirroring the publication-style review logic;
-- row-level model metrics;
-- animal-level anomaly summaries;
-- telemetry quality and movement-feature review before modeling.
+- the movement metrics used by the manuscript profiles, including velocity, turning,
+  sinuosity, rolling movement moments, AKDE/home-range estimates, and season features;
+- how the autoencoder learns normal/reference deer movement through the bottleneck,
+  training-loss curves, and layer weight summaries when saved model files are available;
+- an interactive results explorer for frozen row flags, animal-level calls, and feature
+  residual contributions.
 
 Run from the repository root:
 
 ```bash
-python scripts/generate_sample_data.py
 streamlit run dashboard/app.py
 ```
 
-For the strongest ML/CWD framing in portfolio materials, use a screenshot from the **ML
-Model**, **Feature Contributions**, or **Animal Flags** tab rather than leading with the
-Telemetry Quality view.
+If manuscript artifacts are missing, the dashboard falls back to a reduced synthetic demo so
+the public project still runs without protected data. For portfolio screenshots, lead with
+**Movement Features**, **Model Learning**, or **Results Explorer**.
 
 ## Project Layout
 
@@ -147,6 +159,7 @@ scripts/
   train_manuscript_autoencoder.py     # 32-16-4-16-32 AE notebook port
   apply_manuscript_frozen_rule.py     # frozen row and animal ID rule application
   manuscript_feature_contributions.py # holdout feature residual contribution tables
+  generate_manuscript_synthetic_inputs.py # manuscript-shaped demo inputs
   generate_sample_data.py             # synthetic telemetry for demos/tests
   train_autoencoder.py                # config-driven demo training and artifact export
   evaluate_holdout.py                 # row-level and animal-level metric regeneration
