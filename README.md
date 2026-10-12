@@ -30,6 +30,10 @@ represented here as a peer-reviewed publication.
 This public repository is not a raw-data release for either study. Instead, it demonstrates
 the reproducible engineering and analysis patterns behind the work.
 
+Start with [`CASE_STUDY.md`](CASE_STUDY.md) for the employer-facing walkthrough of the
+research problem, source workflows, autoencoder design, validation controls, results context,
+and public-safe dashboard demo.
+
 ## What This Shows
 
 - GPS fix schedule regularization for mule deer and white-tailed deer telemetry.
@@ -179,6 +183,7 @@ the public project still runs without protected data. For portfolio screenshots,
 ## Project Layout
 
 ```text
+CASE_STUDY.md                         # employer-facing project walkthrough
 R/
   01_regularize_fix_schedule.R        # public-safe telemetry regularization utilities
 src/telemetry_anomaly/
