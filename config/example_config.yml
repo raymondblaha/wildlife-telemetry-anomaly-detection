@@ -1,0 +1,25 @@
+input_csv: data/sample/synthetic_telemetry.csv
+output_dir: outputs/example_run
+animal_col: animal_id
+label_col: label
+reference_label: 0
+validation_size: 0.2
+random_state: 13
+numeric_features:
+  - step_distance_m
+  - elapsed_hours
+  - speed_m_per_hour
+  - turning_angle_deg
+  - rolling_3_step_mean_m
+  - rolling_3_speed_mean
+  - hour
+  - month
+categorical_features:
+  - species
+  - sex
+  - genotype
+latent_dim: 8
+epochs: 25
+batch_size: 128
+threshold_percentile: 95
+min_anomalous_fixes: 3
