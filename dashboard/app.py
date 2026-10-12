@@ -314,11 +314,16 @@ def show_feature_tab(
     feature_columns: list[str] | None,
     processed: pd.DataFrame | None,
 ) -> None:
-    st.subheader("Movement Features Created for the Manuscript Model")
+    st.subheader("1. Preprocessing Results")
     st.write(
-        "These are the movement and temporal features the autoencoder learns to reconstruct. "
-        "When saved artifacts are available, this table also marks which exact encoded columns "
-        "are present in the trained feature matrix."
+        "This tab shows the feature matrix produced before model training. The synthetic "
+        "pipeline follows the manuscript flow: generate public-safe telemetry-shaped inputs, "
+        "clean rows, fit the scaler/season encoder on reference training animals only, then "
+        "write train, validation, and test feature files for the AE."
+    )
+    st.caption(
+        "Key movement metrics include velocity, turning angle, sinuosity, rolling velocity "
+        "moments, rolling turn-angle moments, AKDE/home-range estimates, and season encodings."
     )
     features = feature_table(profile_name, feature_columns)
     st.dataframe(features, use_container_width=True)
@@ -350,7 +355,7 @@ def show_model_tab(
     synthetic_metrics: dict[str, Any] | None = None,
     synthetic_weights: pd.DataFrame | None = None,
 ) -> None:
-    st.subheader("What the Model Is Learning")
+    st.subheader("2. Training the Autoencoder")
     st.write(
         "The autoencoder is trained on reference movement. It compresses each row into a "
         "small bottleneck, reconstructs the movement features, and treats high reconstruction "
@@ -403,6 +408,12 @@ def show_model_tab(
 
     weights = weight_summary if weight_summary is not None else synthetic_weights
     if weights is not None and not weights.empty:
+        st.subheader("Layer Weight Activity")
+        st.caption(
+            "This is not a biological interpretation by itself. It is an engineering view "
+            "showing whether trained layers have nonzero learned weights and where weight "
+            "magnitudes concentrate across the encoder, bottleneck, and decoder."
+        )
         fig = px.imshow(
             weights[["mean_abs_weight", "max_abs_weight", "nonzero_weight_rate"]].T,
             x=weights["layer"],
@@ -426,7 +437,7 @@ def show_results_tab(
     synthetic_scored: pd.DataFrame | None = None,
     synthetic_contribution: pd.DataFrame | None = None,
 ) -> None:
-    st.subheader("Results Explorer")
+    st.subheader("3. AE Anomaly Detection Results")
     source = (
         "saved manuscript artifacts"
         if rows is not None or id_summary is not None
@@ -493,6 +504,55 @@ def show_results_tab(
         st.dataframe(result_contrib, use_container_width=True)
 
 
+def show_pipeline_runbook(profile_name: str, artifact_dir: Path) -> None:
+    st.subheader("Run the Synthetic Manuscript Pipeline")
+    st.write(
+        "Use this when you want the dashboard to show a real artifact flow instead of the "
+        "quick in-dashboard fallback. The command below generates synthetic train/test files, "
+        "preprocesses them, trains the dense AE, applies the frozen animal rule, and writes "
+        "feature residual contribution tables."
+    )
+    rel_output = artifact_dir.relative_to(ROOT) if artifact_dir.is_relative_to(ROOT) else artifact_dir
+    st.code(
+        "\n".join(
+            [
+                f"python scripts/run_synthetic_manuscript_pipeline.py \\",
+                f"  --profile {profile_name} \\",
+                f"  --output-dir {rel_output} \\",
+                "  --epochs 40",
+                "",
+                "streamlit run dashboard/app.py",
+            ]
+        ),
+        language="bash",
+    )
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "stage": "Preprocessing",
+                    "script": "scripts/prepare_manuscript_features.py",
+                    "artifacts": "train_processed_*.csv, val_processed_*.csv, test_processed_*.csv, encoder_*.pkl, scaler_*.pkl, feature_columns_*.pkl",
+                    "dashboard tab": "1. Preprocessing",
+                },
+                {
+                    "stage": "Training AE",
+                    "script": "scripts/train_manuscript_autoencoder.py",
+                    "artifacts": "autoencoder_model.h5, ae_ckpt.weights.h5, training_history.npy, reconstruction_threshold.pkl",
+                    "dashboard tab": "2. AE Model",
+                },
+                {
+                    "stage": "Results",
+                    "script": "scripts/apply_manuscript_frozen_rule.py + scripts/manuscript_feature_contributions.py",
+                    "artifacts": "row flags, residuals, ID summary, id_rule_params.pkl, feature contribution CSVs",
+                    "dashboard tab": "3. AE Results",
+                },
+            ]
+        ),
+        use_container_width=True,
+    )
+
+
 def show_synthetic_metrics(
     scored: pd.DataFrame,
     sweep: pd.DataFrame,
@@ -534,8 +594,8 @@ def main() -> None:
     st.set_page_config(page_title="CWD Telemetry Manuscript Pipeline", layout="wide")
     st.title("CWD Movement Anomaly Manuscript Pipeline")
     st.caption(
-        "Primary focus: manuscript scripts and saved training artifacts. "
-        "Fallback: reduced synthetic dashboard demo."
+        "Presentation flow: preprocess synthetic telemetry, train a dense AE, then inspect "
+        "preprocessing outputs, model artifacts, and anomaly-detection results."
     )
 
     with st.sidebar:
@@ -625,8 +685,8 @@ def main() -> None:
     elif use_synthetic:
         st.warning(
             "Manuscript artifacts were not found in that directory, so the dashboard is showing "
-            "the reduced synthetic ML demo. Run the manuscript scripts locally to populate the "
-            "artifact directory."
+            "a quick in-dashboard fallback. For portfolio screenshots, run the synthetic "
+            "manuscript pipeline so this dashboard loads real saved AE artifacts."
         )
     else:
         st.error("Required manuscript artifacts are missing and synthetic fallback is off.")
@@ -645,12 +705,12 @@ def main() -> None:
             synthetic_metrics,
         ) = synthetic_outputs
 
-    tab_features, tab_model, tab_results, tab_demo, tab_methods = st.tabs(
+    tab_features, tab_model, tab_results, tab_run, tab_methods = st.tabs(
         [
-            "Movement Features",
-            "Model Learning",
-            "Results Explorer",
-            "Synthetic Demo",
+            "1. Preprocessing",
+            "2. AE Model",
+            "3. AE Results",
+            "Run Pipeline",
             "Methods",
         ]
     )
@@ -672,12 +732,12 @@ def main() -> None:
     with tab_results:
         show_results_tab(rows, id_summary, contribution, synthetic_scored, synthetic_contrib)
 
-    with tab_demo:
-        st.subheader("Reduced Synthetic ML Demo")
+    with tab_run:
+        show_pipeline_runbook(profile_name, artifact_dir)
+        st.subheader("Quick In-Dashboard Fallback Metrics")
         st.write(
-            "This section exists only so the public repo can be run without protected data. "
-            "It trains a small reconstruction model on synthetic reference animals and shows "
-            "the same inspection pattern used by the manuscript artifact viewer."
+            "This fallback exists only so the public repo can show something when no saved "
+            "TensorFlow artifacts are present. The preferred portfolio path is the command above."
         )
         if synthetic_outputs is None:
             st.info("Synthetic fallback is disabled or could not run.")

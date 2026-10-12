@@ -87,7 +87,26 @@ The core scripts are:
 | 3 | `scripts/apply_manuscript_frozen_rule.py` | frozen row threshold and animal-level count/fraction rule |
 | 4 | `scripts/manuscript_feature_contributions.py` | squared-residual feature contribution tables |
 
-To create a local public-safe artifact run with manuscript-shaped synthetic data:
+To create a local public-safe artifact run with manuscript-shaped synthetic data, use the
+one-command runner:
+
+```bash
+pip install ".[deep-learning]"
+python scripts/run_synthetic_manuscript_pipeline.py \
+  --profile wtd_primary \
+  --output-dir outputs/wtd_primary \
+  --epochs 40
+```
+
+That command runs the full public demo flow:
+
+1. generate manuscript-shaped synthetic train/test CSVs;
+2. preprocess features with a train-only scaler and season encoder;
+3. train the dense autoencoder;
+4. apply the frozen row and animal-level rule;
+5. write feature residual contribution tables.
+
+The individual commands are:
 
 ```bash
 python scripts/generate_manuscript_synthetic_inputs.py \
@@ -136,14 +155,16 @@ project. It is designed to load saved local artifacts from the manuscript script
 processed CSVs, `feature_columns_*.pkl`, `reconstruction_threshold.pkl`, `id_rule_params.pkl`,
 training history, model weights, row flags, ID summaries, and feature contribution tables.
 
-It is designed to show:
+It follows the presentation flow:
 
-- the movement metrics used by the manuscript profiles, including velocity, turning,
-  sinuosity, rolling movement moments, AKDE/home-range estimates, and season features;
-- how the autoencoder learns normal/reference deer movement through the bottleneck,
-  training-loss curves, and layer weight summaries when saved model files are available;
-- an interactive results explorer for frozen row flags, animal-level calls, and feature
-  residual contributions.
+- **1. Preprocessing**: movement metrics used by the manuscript profiles, including
+  velocity, turning, sinuosity, rolling movement moments, AKDE/home-range estimates, and
+  season features.
+- **2. AE Model**: the dense autoencoder architecture, bottleneck, training-loss curves,
+  frozen threshold metadata, and layer weight summaries when saved model files are
+  available.
+- **3. AE Results**: frozen row flags, animal-level calls, reconstruction-error
+  distributions, and feature residual contributions.
 
 Run from the repository root:
 

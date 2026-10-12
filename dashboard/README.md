@@ -4,25 +4,17 @@ This Streamlit dashboard is a reduced inspection layer for the manuscript-profil
 pipeline. It loads saved local artifacts first and falls back to a small synthetic
 demo only when those artifacts are missing.
 
-The main tabs are:
+The main tabs are organized as the public demo flow:
 
-- **Movement Features**: manuscript movement metrics such as velocity, absolute
+- **1. Preprocessing**: manuscript movement metrics such as velocity, absolute
   relative angle, sinuosity, rolling movement moments, AKDE/home-range estimates,
   and season encodings.
-- **Model Learning**: autoencoder architecture, frozen threshold metadata, training
+- **2. AE Model**: autoencoder architecture, frozen threshold metadata, training
   history, and layer weight summaries when `autoencoder_model.h5` is available.
-- **Results Explorer**: frozen row flags, animal-level ID summaries, and feature
+- **3. AE Results**: frozen row flags, animal-level ID summaries, and feature
   residual contribution tables.
-
-Conceptually, the dashboard follows the secondary public-demo flow:
-
-1. Preprocessing: inspect engineered movement features such as AKDE low/estimate/high,
-   rolling velocity mean, rolling velocity standard deviation, turning angle summaries,
-   and season encodings.
-2. Training AE: inspect the saved dense autoencoder architecture, training history,
-   threshold metadata, and layer weight summaries when a trained `.h5` model is available.
-3. Results: interact with saved row-level anomaly flags, animal-level calls, and feature
-   reconstruction residuals from the frozen manuscript-style evaluation.
+- **Run Pipeline**: exact command to generate synthetic data, preprocess it, train the AE,
+  apply the frozen rule, and refresh the dashboard artifacts.
 
 Expected artifact directory contents include:
 
@@ -41,7 +33,17 @@ Run from the repository root:
 streamlit run dashboard/app.py
 ```
 
-To generate a public-safe artifact set first:
+To generate a public-safe artifact set first, use the one-command runner:
+
+```bash
+pip install ".[deep-learning]"
+python scripts/run_synthetic_manuscript_pipeline.py \
+  --profile wtd_primary \
+  --output-dir outputs/wtd_primary \
+  --epochs 40
+```
+
+The individual steps are:
 
 ```bash
 python scripts/generate_manuscript_synthetic_inputs.py \
