@@ -25,6 +25,8 @@ Blaha, R. L. et al. (2026). [Use of deep learning to predict chronic wasting dis
 
 This public repository is not a raw-data release for that study. Instead, it presents a privacy-conscious, reproducible version of the workflow concepts: telemetry cleaning, movement-feature engineering, animal-level validation, frozen-threshold anomaly detection, and public-safe dashboarding.
 
+The white-tailed deer workflow represented here extends the same public-safe pipeline concepts for a draft manuscript being prepared for peer review in the same journal. That manuscript focuses on CWD-associated movement changes in white-tailed deer and is not yet represented here as a peer-reviewed publication.
+
 ## Project Layout
 
 ```text
