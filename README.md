@@ -21,8 +21,10 @@ This public repository is not a raw-data release for either study. Instead, it d
 - GPS fix schedule regularization for mule deer and white-tailed deer telemetry.
 - Movement feature engineering: step length, speed, turning angle, rolling movement summaries, season/time features, and AKDE-ready outputs.
 - Animal-level train/validation/test splitting to avoid leakage across repeated GPS fixes.
-- Autoencoder anomaly detection using frozen preprocessing, frozen feature order, and a threshold selected before final test evaluation.
+- TensorFlow/Keras autoencoder anomaly detection using frozen preprocessing, frozen feature order, and a threshold selected before final test evaluation.
+- Manuscript-style threshold policies, including validation percentiles, train-lowest thresholds, row false-positive rate, ID flag rate, train quantiles, and MAD.
 - Row-level and animal-level reporting so model metrics are not confused with independent biological replicates.
+- Feature residual contribution tables showing which movement dimensions drive reconstruction error.
 - Cross-species and genotype-transfer experiment design without publishing sensitive raw telemetry.
 - A dashboard layer for inspecting autoencoder-style reconstruction error, feature residual contributions, and animal-level anomaly calls using synthetic data.
 
@@ -36,6 +38,7 @@ This public repository is not a raw-data release for either study. Instead, it d
 6. Train an autoencoder on the reference movement distribution.
 7. Freeze the reconstruction-error threshold using training/validation data.
 8. Evaluate on held-out animals and report both row-level and animal-level results.
+9. Summarize feature-level squared residual contributions for model interpretation.
 
 ## Public-Safe Analysis Dashboard
 
@@ -59,6 +62,39 @@ streamlit run dashboard/app.py
 
 For the strongest ML/CWD framing in portfolio materials, use a screenshot from the **ML Model**, **Feature Contributions**, or **Animal Flags** tab rather than leading with the Telemetry Quality view.
 
+## Reproducible Pipeline Commands
+
+Generate synthetic public-safe telemetry:
+
+```bash
+python scripts/generate_sample_data.py
+```
+
+Run the manuscript-derived TensorFlow autoencoder workflow:
+
+```bash
+pip install ".[deep-learning]"
+python scripts/train_autoencoder.py --config config/example_config.yml
+```
+
+Recompute animal-level evaluation from saved predictions:
+
+```bash
+python scripts/evaluate_holdout.py \
+  --predictions outputs/example_run/test_predictions.csv \
+  --output-dir outputs/example_run
+```
+
+Recompute manuscript-style feature contribution tables from saved residuals:
+
+```bash
+python scripts/feature_contributions.py \
+  --predictions outputs/example_run/test_predictions.csv \
+  --residuals outputs/example_run/test_feature_residuals.csv \
+  --features outputs/example_run/feature_columns.joblib \
+  --output-dir outputs/example_run
+```
+
 ## Project Layout
 
 ```text
@@ -68,14 +104,18 @@ src/telemetry_anomaly/
   preprocessing.py                  # feature engineering and grouped splits
   autoencoder.py                    # TensorFlow/Keras reconstruction model helpers
   evaluation.py                     # row-level and animal-level metrics
+  feature_contributions.py          # squared-residual contribution summaries
 scripts/
-  train_autoencoder.py              # config-driven training entrypoint
   generate_sample_data.py           # synthetic telemetry for demos/tests
+  train_autoencoder.py              # config-driven training and artifact export
+  evaluate_holdout.py               # row-level and animal-level metric regeneration
+  feature_contributions.py          # manuscript-style residual contribution tables
 dashboard/
   app.py                            # Streamlit analysis dashboard
 docs/
   data_schema.md                    # expected public-safe input columns
   methods.md                        # modeling and validation design
+  manuscript_code_mapping.md        # mapping from private notebooks to public scripts
   reproducibility_checklist.md      # controls needed before claiming results
   sensitive_data_policy.md          # what must stay out of GitHub
 config/
