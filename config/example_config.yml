@@ -3,6 +3,11 @@ output_dir: outputs/example_run
 animal_col: animal_id
 label_col: label
 reference_label: 0
+metadata_columns:
+  - timestamp
+  - species
+  - sex
+  - genotype
 validation_size: 0.2
 random_state: 13
 numeric_features:
@@ -21,5 +26,14 @@ categorical_features:
 latent_dim: 8
 epochs: 25
 batch_size: 128
+loss_lambda: 0.5
+threshold_policy: validation_percentile
 threshold_percentile: 95
+lowest_frac: 0.75
+lowest_quantile: 90
+train_quantile: 0.9
+val_row_fpr: 0.2
+val_id_rate: 0.2
+min_rows_per_id: 1
+mad_k: 3.0
 min_anomalous_fixes: 3
