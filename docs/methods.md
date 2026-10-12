@@ -38,6 +38,17 @@ The model learns to reconstruct a reference movement distribution, such as CWD-n
 
 The threshold must be selected from training or validation errors before final test evaluation. Do not tune the threshold on final test outcomes.
 
+The public training entrypoint supports manuscript-style threshold policies:
+
+- `validation_percentile`;
+- `train_lowest_p95`;
+- `train_quantile`;
+- `val_row_fpr`;
+- `val_id_flag_rate`;
+- `mad`.
+
+The default public config uses a validation percentile for simplicity, while the manuscript notebooks also used train-lowest and ID-rate policies in sensitivity experiments.
+
 ## 5. Reporting
 
 Report two levels of results:
@@ -46,6 +57,8 @@ Report two levels of results:
 - animal-level metrics for biological interpretation.
 
 Animal-level reporting requires a documented rule, such as "flag an animal if at least N fixes exceed the frozen threshold."
+
+The pipeline also saves per-feature squared reconstruction residuals so feature contribution tables can be regenerated without retraining. These tables report the percent of mean squared residual assigned to each model input feature for all rows, flagged rows, and comparison rows.
 
 ## 6. Cross-Species and Genotype Transfer
 
