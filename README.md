@@ -29,6 +29,8 @@ src/telemetry_anomaly/
 scripts/
   train_autoencoder.py              # config-driven training entrypoint
   generate_sample_data.py           # synthetic telemetry for demos/tests
+dashboard/
+  app.py                            # Streamlit analysis dashboard
 docs/
   data_schema.md                    # expected public-safe input columns
   methods.md                        # modeling and validation design
@@ -52,6 +54,17 @@ research_archive/
 6. Train an autoencoder on the reference movement distribution.
 7. Freeze the reconstruction-error threshold using training/validation data.
 8. Evaluate on held-out animals and report both row-level and animal-level results.
+
+## Dashboard
+
+The repository includes a Streamlit dashboard for analyst-friendly review of the public-safe workflow:
+
+```bash
+python scripts/generate_sample_data.py
+streamlit run dashboard/app.py
+```
+
+The dashboard uses synthetic telemetry to show data-quality checks, movement-feature distributions, frozen-threshold evaluation, and animal-level anomaly review.
 
 ## Why This Matters
 
