@@ -1,10 +1,12 @@
-"""Streamlit dashboard for public-safe telemetry anomaly analysis."""
+"""Streamlit dashboard for manuscript-profile telemetry anomaly outputs."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -19,11 +21,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from telemetry_anomaly.evaluation import animal_level_flags, row_level_metrics
+from telemetry_anomaly.manuscript_profiles import get_profile
 from telemetry_anomaly.preprocessing import add_movement_features, animal_group_split
 
 
 SAMPLE_PATH = ROOT / "data" / "sample" / "synthetic_telemetry.csv"
-NUMERIC_FEATURES = [
+DEFAULT_ARTIFACT_DIR = ROOT / "outputs" / "wtd_primary"
+SYNTHETIC_FEATURES = [
     "step_distance_m",
     "elapsed_hours",
     "speed_m_per_hour",
@@ -33,49 +37,143 @@ NUMERIC_FEATURES = [
     "hour",
     "month",
 ]
+FEATURE_GLOSSARY = {
+    "velo": ("Velocity", "Movement speed between fixes."),
+    "abs_rel_angle": ("Turning", "Absolute relative turn angle."),
+    "sinuosity": ("Path shape", "Path tortuosity for a movement segment."),
+    "sinuosity_28pt": ("Path shape", "Mule deer 28-point path tortuosity metric."),
+    "rolling_abs_rel_angle_mean": ("Rolling turning", "Rolling mean turn angle."),
+    "rolling_abs_rel_angle_sd": ("Rolling turning", "Rolling turn-angle variability."),
+    "rolling_abs_rel_angle_skew": ("Rolling turning", "Rolling turn-angle skewness."),
+    "rolling_abs_rel_angle_kurt": ("Rolling turning", "Rolling turn-angle kurtosis."),
+    "rolling_velo_mean": ("Rolling velocity", "Rolling mean velocity."),
+    "rolling_velo_sd": ("Rolling velocity", "Rolling velocity variability."),
+    "rolling_velo_skew": ("Rolling velocity", "Rolling velocity skewness."),
+    "rolling_velo_kurt": ("Rolling velocity", "Rolling velocity kurtosis."),
+    "akde_low": ("Home range", "Lower AKDE estimate."),
+    "akde_est": ("Home range", "Central AKDE estimate."),
+    "akde_high": ("Home range", "Upper AKDE estimate."),
+    "low": ("Home range", "Lower home-range estimate from mule deer workflow."),
+    "est": ("Home range", "Central home-range estimate from mule deer workflow."),
+    "high": ("Home range", "Upper home-range estimate from mule deer workflow."),
+    "season": ("Temporal", "Season category encoded from telemetry date."),
+}
+
+
+def required_artifacts(profile_name: str, artifact_dir: Path) -> dict[str, Path]:
+    profile = get_profile(profile_name)
+    suffix = profile.processed_suffix
+    return {
+        "feature_columns": artifact_dir / f"feature_columns_{suffix}.pkl",
+        "train": artifact_dir / f"train_processed_{suffix}.csv",
+        "validation": artifact_dir / f"val_processed_{suffix}.csv",
+        "test": artifact_dir / f"test_processed_{suffix}.csv",
+        "threshold": artifact_dir / "reconstruction_threshold.pkl",
+        "id_rule": artifact_dir / "id_rule_params.pkl",
+        "rows": artifact_dir / f"test_processed_{suffix}_rows_with_flags_FROZEN.csv",
+        "residuals": artifact_dir / f"test_processed_{suffix}_rows_with_recon_and_residuals.csv",
+        "id_summary": artifact_dir / f"test_processed_{suffix}_id_summary_FROZEN.csv",
+        "contrib": artifact_dir / "ae_feature_contributions_holdout.csv",
+        "contrib_summary": artifact_dir / "ae_feature_contribution_summary_holdout.csv",
+        "history": artifact_dir / "training_history.npy",
+        "model": artifact_dir / "autoencoder_model.h5",
+    }
+
+
+def existing_artifacts(paths: dict[str, Path]) -> dict[str, bool]:
+    return {name: path.exists() for name, path in paths.items()}
 
 
 @st.cache_data
-def load_dashboard_data(path: str) -> pd.DataFrame:
-    """Load telemetry and add public-safe movement features."""
+def load_optional_csv(path: str) -> pd.DataFrame | None:
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return None
+    return pd.read_csv(csv_path)
 
+
+@st.cache_data
+def load_optional_joblib(path: str) -> Any | None:
+    pkl_path = Path(path)
+    if not pkl_path.exists():
+        return None
+    return joblib.load(pkl_path)
+
+
+@st.cache_data
+def load_training_history(path: str) -> pd.DataFrame | None:
+    history_path = Path(path)
+    if not history_path.exists():
+        return None
+    raw = np.load(history_path, allow_pickle=True).item()
+    history = pd.DataFrame(raw)
+    history["epoch"] = np.arange(1, len(history) + 1)
+    return history
+
+
+@st.cache_resource(show_spinner=False)
+def load_weight_summary(model_path: str) -> pd.DataFrame | None:
+    path = Path(model_path)
+    if not path.exists():
+        return None
+    try:
+        from tensorflow.keras.models import load_model
+    except ImportError:
+        return None
+
+    model = load_model(path, compile=False)
+    rows = []
+    for layer in model.layers:
+        weights = layer.get_weights()
+        if not weights:
+            continue
+        kernel = weights[0]
+        rows.append(
+            {
+                "layer": layer.name,
+                "shape": "x".join(str(x) for x in kernel.shape),
+                "mean_abs_weight": float(np.mean(np.abs(kernel))),
+                "max_abs_weight": float(np.max(np.abs(kernel))),
+                "nonzero_weight_rate": float(np.mean(np.abs(kernel) > 1e-12)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data
+def load_synthetic_data(path: str) -> pd.DataFrame:
     csv_path = Path(path)
     if not csv_path.exists():
         st.error(
-            "Sample data not found. Run `python scripts/generate_sample_data.py` "
+            "Synthetic data not found. Run `python scripts/generate_sample_data.py` "
             "from the repository root."
         )
         st.stop()
 
     raw = pd.read_csv(csv_path)
-    featured = add_movement_features(raw).dropna(subset=NUMERIC_FEATURES + ["label"]).copy()
+    featured = add_movement_features(raw).dropna(subset=SYNTHETIC_FEATURES + ["label"])
+    featured = featured.copy()
     featured["label_name"] = np.where(featured["label"] == 1, "comparison", "reference")
     return featured
 
 
 def contribution_percent(residual_sq: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Summarize feature residual contributions as percentages."""
-
     if residual_sq.size == 0 or not np.any(mask):
         return np.full(residual_sq.shape[1], np.nan, dtype=float)
-    mean_residual = np.nanmean(residual_sq[mask], axis=0)
-    total = np.nansum(mean_residual)
-    if total <= 0:
-        return np.full(residual_sq.shape[1], np.nan, dtype=float)
-    return mean_residual / total * 100.0
+    means = np.nanmean(residual_sq[mask], axis=0)
+    total = np.nansum(means)
+    return (means / total) * 100.0 if total > 0 else np.full(residual_sq.shape[1], np.nan)
 
 
-@st.cache_data(show_spinner="Training autoencoder-style model on synthetic reference animals...")
-def fit_dashboard_autoencoder(
+@st.cache_data(show_spinner="Training reduced synthetic reconstruction model...")
+def fit_synthetic_demo(
     df: pd.DataFrame,
     threshold_percentile: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float | int | str]]:
-    """Train a lightweight reconstruction model and score all selected telemetry rows."""
-
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float | int | str]]:
     out = df.copy()
     reference = out[out["label"] == 0].copy()
     if reference["animal_id"].nunique() < 2:
-        raise ValueError("Select at least two reference animals so the model can hold one out.")
+        raise ValueError("Select at least two reference animals.")
 
     reference_train, reference_val = animal_group_split(
         reference,
@@ -85,9 +183,9 @@ def fit_dashboard_autoencoder(
     )
 
     scaler = MinMaxScaler()
-    x_train = scaler.fit_transform(reference_train[NUMERIC_FEATURES])
-    x_val = scaler.transform(reference_val[NUMERIC_FEATURES])
-    x_all = scaler.transform(out[NUMERIC_FEATURES])
+    x_train = scaler.fit_transform(reference_train[SYNTHETIC_FEATURES])
+    x_val = scaler.transform(reference_val[SYNTHETIC_FEATURES])
+    x_all = scaler.transform(out[SYNTHETIC_FEATURES])
 
     model = MLPRegressor(
         hidden_layer_sizes=(32, 16, 4, 16, 32),
@@ -107,45 +205,51 @@ def fit_dashboard_autoencoder(
     recon_val = model.predict(x_val)
     residual_sq = (x_all - recon_all) ** 2
     val_error = np.sum((x_val - recon_val) ** 2, axis=1)
-
     threshold = float(np.nanpercentile(val_error, threshold_percentile))
-    out["reconstruction_error"] = residual_sq.sum(axis=1)
-    out["is_anomaly"] = out["reconstruction_error"] >= threshold
-    out["threshold_percentile"] = threshold_percentile
 
-    flagged_mask = out["is_anomaly"].to_numpy(bool)
+    out["reconstruction_error"] = residual_sq.sum(axis=1)
+    out["row_flag"] = out["reconstruction_error"] >= threshold
+    flagged_mask = out["row_flag"].to_numpy(bool)
     comparison_mask = out["label"].eq(1).to_numpy(bool)
     contribution = pd.DataFrame(
         {
-            "feature": NUMERIC_FEATURES,
-            "flagged_contribution_pct": contribution_percent(residual_sq, flagged_mask),
-            "comparison_contribution_pct": contribution_percent(residual_sq, comparison_mask),
-            "all_rows_contribution_pct": contribution_percent(
-                residual_sq,
-                np.ones(len(out), dtype=bool),
-            ),
+            "feature": SYNTHETIC_FEATURES,
+            "Flagged_%": contribution_percent(residual_sq, flagged_mask),
+            "Comparison_%": contribution_percent(residual_sq, comparison_mask),
+            "All_%": contribution_percent(residual_sq, np.ones(len(out), dtype=bool)),
         }
-    ).sort_values("flagged_contribution_pct", ascending=False)
+    ).sort_values("Flagged_%", ascending=False)
 
     y_true = out["label"].astype(int).to_numpy()
-    y_pred = out["is_anomaly"].astype(int).to_numpy()
+    y_pred = out["row_flag"].astype(int).to_numpy()
     metrics = row_level_metrics(y_true, y_pred)
-    sweep_rows = []
+    sweep = []
     for percentile in range(80, 100):
-        sweep_threshold = float(np.nanpercentile(val_error, percentile))
-        sweep_pred = out["reconstruction_error"].ge(sweep_threshold).astype(int).to_numpy()
-        sweep_metrics = row_level_metrics(y_true, sweep_pred)
-        sweep_rows.append(
+        cutoff = float(np.nanpercentile(val_error, percentile))
+        pred = out["reconstruction_error"].ge(cutoff).astype(int).to_numpy()
+        sweep_metrics = row_level_metrics(y_true, pred)
+        sweep.append(
             {
                 "percentile": percentile,
-                "threshold": sweep_threshold,
-                "flagged_fix_rate": float(sweep_pred.mean()),
+                "threshold": cutoff,
+                "flagged_fix_rate": float(pred.mean()),
+                "balanced_accuracy": sweep_metrics["balanced_accuracy"],
                 "sensitivity": sweep_metrics["sensitivity_recall"],
                 "specificity": sweep_metrics["specificity"],
-                "balanced_accuracy": sweep_metrics["balanced_accuracy"],
             }
         )
-    threshold_sweep = pd.DataFrame(sweep_rows)
+    weight_summary = pd.DataFrame(
+        [
+            {
+                "layer": f"dense_{i + 1}",
+                "shape": "x".join(str(x) for x in coef.shape),
+                "mean_abs_weight": float(np.mean(np.abs(coef))),
+                "max_abs_weight": float(np.max(np.abs(coef))),
+                "nonzero_weight_rate": float(np.mean(np.abs(coef) > 1e-12)),
+            }
+            for i, coef in enumerate(model.coefs_)
+        ]
+    )
     metrics.update(
         {
             "threshold": threshold,
@@ -155,425 +259,454 @@ def fit_dashboard_autoencoder(
             "reference_train_rows": int(len(reference_train)),
             "reference_validation_rows": int(len(reference_val)),
             "model_iterations": int(model.n_iter_),
-            "model_family": "sklearn MLPRegressor reconstruction model",
+            "model_family": "synthetic sklearn reconstruction model",
             "latent_width": 4,
         }
     )
-    return out, contribution, threshold_sweep, metrics
+    return out, contribution, pd.DataFrame(sweep), weight_summary, metrics
+
+
+def feature_table(profile_name: str, feature_columns: list[str] | None) -> pd.DataFrame:
+    profile = get_profile(profile_name)
+    rows = []
+    base_features = profile.numeric_features + profile.categorical_features
+    for feature in base_features:
+        family, description = FEATURE_GLOSSARY.get(feature, ("Encoded", "Model input feature."))
+        rows.append(
+            {
+                "feature": feature,
+                "family": family,
+                "description": description,
+                "from_profile": True,
+                "present_in_artifact": feature_columns is None or feature in feature_columns,
+            }
+        )
+    if feature_columns:
+        for feature in feature_columns:
+            if feature not in base_features and feature.startswith("season_"):
+                rows.append(
+                    {
+                        "feature": feature,
+                        "family": "Temporal",
+                        "description": "One-hot encoded season column.",
+                        "from_profile": False,
+                        "present_in_artifact": True,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def artifact_status_table(paths: dict[str, Path], exists: dict[str, bool]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "artifact": name,
+                "status": "found" if exists[name] else "missing",
+                "path": str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path),
+            }
+            for name, path in paths.items()
+        ]
+    )
+
+
+def show_feature_tab(
+    profile_name: str,
+    feature_columns: list[str] | None,
+    processed: pd.DataFrame | None,
+) -> None:
+    st.subheader("Movement Features Created for the Manuscript Model")
+    st.write(
+        "These are the movement and temporal features the autoencoder learns to reconstruct. "
+        "When saved artifacts are available, this table also marks which exact encoded columns "
+        "are present in the trained feature matrix."
+    )
+    features = feature_table(profile_name, feature_columns)
+    st.dataframe(features, use_container_width=True)
+
+    if processed is None:
+        st.info("Processed training/test CSVs were not found, so distributions are hidden.")
+        return
+
+    numeric_cols = [c for c in features["feature"].tolist() if c in processed.columns]
+    if not numeric_cols:
+        return
+    selected = st.selectbox("Inspect feature distribution", numeric_cols)
+    fig = px.histogram(
+        processed,
+        x=selected,
+        nbins=50,
+        title=f"{selected} Distribution in Loaded Processed Rows",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(processed[numeric_cols].describe().T.reset_index(), use_container_width=True)
+
+
+def show_model_tab(
+    profile_name: str,
+    threshold_info: dict[str, Any] | None,
+    id_rule: dict[str, Any] | None,
+    history: pd.DataFrame | None,
+    weight_summary: pd.DataFrame | None,
+    synthetic_metrics: dict[str, Any] | None = None,
+    synthetic_weights: pd.DataFrame | None = None,
+) -> None:
+    st.subheader("What the Model Is Learning")
+    st.write(
+        "The autoencoder is trained on reference movement. It compresses each row into a "
+        "small bottleneck, reconstructs the movement features, and treats high reconstruction "
+        "error as evidence that a row does not look like the learned reference pattern."
+    )
+
+    profile = get_profile(profile_name)
+    architecture = pd.DataFrame(
+        [
+            {"stage": "input", "width": "feature count", "purpose": "scaled movement features"},
+            {"stage": "encoder_1", "width": 32, "purpose": "learn broad movement patterns"},
+            {"stage": "encoder_2", "width": 16, "purpose": "compress stable patterns"},
+            {"stage": "bottleneck", "width": 4, "purpose": "low-dimensional reference signal"},
+            {"stage": "decoder_1", "width": 16, "purpose": "reconstruct compressed signal"},
+            {"stage": "decoder_2", "width": 32, "purpose": "reconstruct feature detail"},
+            {"stage": "output", "width": "feature count", "purpose": "predicted feature values"},
+        ]
+    )
+    st.dataframe(architecture, use_container_width=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Profile", profile.name)
+    c2.metric("Default LR", f"{profile.default_learning_rate:g}")
+    c3.metric("Default Batch", f"{profile.default_batch_size}")
+    c4.metric("Default Count Rule", f"{profile.default_count_rule}")
+
+    if threshold_info:
+        st.subheader("Frozen Threshold")
+        st.dataframe(pd.DataFrame([threshold_info]), use_container_width=True)
+    if id_rule:
+        st.subheader("Frozen Animal Rule")
+        st.dataframe(pd.json_normalize(id_rule), use_container_width=True)
+
+    if history is not None and {"loss", "epoch"}.issubset(history.columns):
+        y_cols = [c for c in ["loss", "val_loss"] if c in history.columns]
+        fig = px.line(
+            history,
+            x="epoch",
+            y=y_cols,
+            markers=True,
+            title="Training Loss by Epoch",
+            labels={"value": "scaled MSE loss", "variable": "series"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    elif synthetic_metrics:
+        st.info(
+            f"Synthetic fallback trained for {synthetic_metrics['model_iterations']} iterations "
+            "because saved TensorFlow training history was not found."
+        )
+
+    weights = weight_summary if weight_summary is not None else synthetic_weights
+    if weights is not None and not weights.empty:
+        fig = px.imshow(
+            weights[["mean_abs_weight", "max_abs_weight", "nonzero_weight_rate"]].T,
+            x=weights["layer"],
+            y=["mean abs", "max abs", "nonzero rate"],
+            aspect="auto",
+            title="Layer Weight Activity Summary",
+            color_continuous_scale="Viridis",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(weights, use_container_width=True)
+    else:
+        st.caption(
+            "Add `autoencoder_model.h5` in the artifact directory to show layer weight activity."
+        )
+
+
+def show_results_tab(
+    rows: pd.DataFrame | None,
+    id_summary: pd.DataFrame | None,
+    contribution: pd.DataFrame | None,
+    synthetic_scored: pd.DataFrame | None = None,
+    synthetic_contribution: pd.DataFrame | None = None,
+) -> None:
+    st.subheader("Results Explorer")
+    source = (
+        "saved manuscript artifacts"
+        if rows is not None or id_summary is not None
+        else "synthetic fallback"
+    )
+    st.caption(f"Current source: {source}.")
+
+    result_rows = rows if rows is not None else synthetic_scored
+    result_contrib = contribution if contribution is not None else synthetic_contribution
+
+    if id_summary is not None:
+        flag_col = "is_positive_id" if "is_positive_id" in id_summary.columns else None
+        if flag_col:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Animals", f"{len(id_summary):,}")
+            c2.metric("Flagged Animals", f"{int(id_summary[flag_col].sum()):,}")
+            c3.metric("Flagged Rate", f"{id_summary[flag_col].mean():.1%}")
+        st.dataframe(id_summary, use_container_width=True)
+        if {"id", "n_flags"}.issubset(id_summary.columns):
+            fig = px.bar(
+                id_summary.sort_values("n_flags", ascending=False),
+                x="id",
+                y="n_flags",
+                color=flag_col if flag_col else None,
+                title="Animal-Level Flag Counts",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    elif synthetic_scored is not None:
+        animal_flags = animal_level_flags(
+            synthetic_scored,
+            animal_col="animal_id",
+            label_col="label",
+            flag_col="row_flag",
+            min_anomalous_fixes=3,
+        )
+        st.dataframe(animal_flags, use_container_width=True)
+
+    if result_rows is not None and "reconstruction_error" in result_rows.columns:
+        st.subheader("Row-Level Reconstruction Errors")
+        color_col = "row_flag" if "row_flag" in result_rows.columns else None
+        fig = px.histogram(
+            result_rows,
+            x="reconstruction_error",
+            color=color_col,
+            nbins=50,
+            title="Row Reconstruction Error Distribution",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(result_rows.head(500), use_container_width=True)
+
+    if result_contrib is not None:
+        st.subheader("Feature Residual Contributions")
+        percent_cols = [c for c in result_contrib.columns if c.endswith("%") or c.endswith("_%")]
+        if percent_cols:
+            selected_col = st.selectbox("Contribution column", percent_cols)
+            fig = px.bar(
+                result_contrib.sort_values(selected_col, ascending=True),
+                x=selected_col,
+                y="feature",
+                orientation="h",
+                title=f"{selected_col} by Feature",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(result_contrib, use_container_width=True)
+
+
+def show_synthetic_metrics(
+    scored: pd.DataFrame,
+    sweep: pd.DataFrame,
+    metrics: dict[str, Any],
+) -> None:
+    st.subheader("Synthetic Demo Metrics")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sensitivity", f"{metrics['sensitivity_recall']:.2f}")
+    c2.metric("Specificity", f"{metrics['specificity']:.2f}")
+    c3.metric("Precision", f"{metrics['precision']:.2f}")
+    c4.metric("Balanced Accuracy", f"{metrics['balanced_accuracy']:.2f}")
+
+    fig = px.line(
+        sweep,
+        x="percentile",
+        y=["flagged_fix_rate", "balanced_accuracy", "sensitivity", "specificity"],
+        markers=True,
+        title="Synthetic Threshold Sensitivity",
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+    cm = confusion_matrix(
+        scored["label"].astype(int).to_numpy(),
+        scored["row_flag"].astype(int).to_numpy(),
+        labels=[0, 1],
+    )
+    st.dataframe(
+        pd.DataFrame(
+            cm,
+            index=["Actual reference", "Actual comparison"],
+            columns=["Predicted reference", "Predicted anomaly"],
+        ),
+        use_container_width=True,
+    )
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="Wildlife Telemetry Anomaly Dashboard",
-        layout="wide",
-    )
-
-    st.title("CWD Movement Anomaly Detection Dashboard")
+    st.set_page_config(page_title="CWD Telemetry Manuscript Pipeline", layout="wide")
+    st.title("CWD Movement Anomaly Manuscript Pipeline")
     st.caption(
-        "Public-safe synthetic demo of an autoencoder-style ML workflow for cervid "
-        "CWD movement studies."
+        "Primary focus: manuscript scripts and saved training artifacts. "
+        "Fallback: reduced synthetic dashboard demo."
     )
-
-    df = load_dashboard_data(str(SAMPLE_PATH))
 
     with st.sidebar:
-        st.header("Filters")
-        species = st.multiselect(
-            "Species",
-            sorted(df["species"].unique()),
-            default=sorted(df["species"].unique()),
+        st.header("Manuscript Artifacts")
+        profile_name = st.selectbox(
+            "Profile",
+            ["wtd_primary", "wtd_four_pings", "mule_60_40"],
         )
-        sex = st.multiselect("Sex", sorted(df["sex"].unique()), default=sorted(df["sex"].unique()))
-        genotype = st.multiselect(
-            "Genotype",
-            sorted(df["genotype"].unique()),
-            default=sorted(df["genotype"].unique()),
+        artifact_dir = Path(
+            st.text_input(
+                "Artifact directory",
+                value=str(DEFAULT_ARTIFACT_DIR.relative_to(ROOT)),
+                help=(
+                    "Directory created by the manuscript scripts, such as outputs/wtd_primary. "
+                    "The dashboard loads saved pkl, csv, npy, and h5 files from here."
+                ),
+            )
         )
-        st.header("Model Controls")
+        if not artifact_dir.is_absolute():
+            artifact_dir = ROOT / artifact_dir
+
+        use_synthetic = st.checkbox(
+            "Use synthetic fallback when artifacts are missing",
+            value=True,
+        )
         threshold_percentile = st.slider(
-            "Reference validation threshold percentile",
+            "Synthetic fallback threshold percentile",
             80,
             99,
             95,
-            help=(
-                "Higher values make row-level anomaly calls stricter. This moves the threshold "
-                "line and changes the flagged fix rate."
-            ),
-        )
-        min_anomalous_fixes = st.slider(
-            "Animal flag rule: minimum anomalous fixes",
-            1,
-            20,
-            3,
-            help=(
-                "An animal is called anomalous only when at least this many of its GPS fixes "
-                "are above the reconstruction-error threshold."
-            ),
-        )
-        st.caption(
-            "Threshold percentile controls row flags; minimum fixes controls animal-level calls."
         )
 
-    filtered = df[
-        df["species"].isin(species)
-        & df["sex"].isin(sex)
-        & df["genotype"].isin(genotype)
-    ].copy()
-    if filtered.empty:
-        st.warning("Select at least one filter value in each sidebar control.")
-        st.stop()
+    paths = required_artifacts(profile_name, artifact_dir)
+    exists = existing_artifacts(paths)
+    artifact_ready = (
+        exists["feature_columns"]
+        and exists["train"]
+        and exists["validation"]
+        and exists["test"]
+    )
+    result_ready = exists["rows"] or exists["id_summary"] or exists["contrib"]
 
-    try:
-        scored, feature_contribution, threshold_sweep, model_metrics = fit_dashboard_autoencoder(
-            filtered,
-            threshold_percentile,
+    status = artifact_status_table(paths, exists)
+    with st.expander("Artifact Status", expanded=not artifact_ready):
+        st.dataframe(status, use_container_width=True)
+
+    feature_columns = load_optional_joblib(str(paths["feature_columns"]))
+    threshold_info = load_optional_joblib(str(paths["threshold"]))
+    id_rule = load_optional_joblib(str(paths["id_rule"]))
+    history = load_training_history(str(paths["history"]))
+    weight_summary = load_weight_summary(str(paths["model"]))
+
+    train = load_optional_csv(str(paths["train"]))
+    validation = load_optional_csv(str(paths["validation"]))
+    test = load_optional_csv(str(paths["test"]))
+    processed_inputs = [
+        df.assign(split=name)
+        for name, df in [
+            ("train", train),
+            ("validation", validation),
+            ("test", test),
+        ]
+        if df is not None
+    ]
+    processed = (
+        pd.concat(processed_inputs, ignore_index=True)
+        if processed_inputs
+        else None
+    )
+    rows = load_optional_csv(str(paths["rows"]))
+    id_summary = load_optional_csv(str(paths["id_summary"]))
+    contribution = load_optional_csv(str(paths["contrib"]))
+
+    synthetic_outputs = None
+    if use_synthetic and (not artifact_ready or not result_ready):
+        synthetic_df = load_synthetic_data(str(SAMPLE_PATH))
+        try:
+            synthetic_outputs = fit_synthetic_demo(synthetic_df, threshold_percentile)
+        except ValueError as exc:
+            st.warning(str(exc))
+
+    if artifact_ready:
+        st.success(
+            "Loaded manuscript-profile processed files. The dashboard is reading saved local "
+            "artifacts rather than fabricating the result surface."
         )
-    except ValueError as exc:
-        st.warning(str(exc))
-        st.stop()
+    elif use_synthetic:
+        st.warning(
+            "Manuscript artifacts were not found in that directory, so the dashboard is showing "
+            "the reduced synthetic ML demo. Run the manuscript scripts locally to populate the "
+            "artifact directory."
+        )
+    else:
+        st.error("Required manuscript artifacts are missing and synthetic fallback is off.")
 
-    st.info(
-        "This dashboard trains a lightweight autoencoder-style neural network on synthetic "
-        "reference movement data, reconstructs held-out movement features, and flags rows "
-        "with high reconstruction error. The production research workflow uses TensorFlow "
-        "autoencoders with protected telemetry data."
-    )
+    synthetic_scored = None
+    synthetic_contrib = None
+    synthetic_sweep = None
+    synthetic_weights = None
+    synthetic_metrics = None
+    if synthetic_outputs is not None:
+        (
+            synthetic_scored,
+            synthetic_contrib,
+            synthetic_sweep,
+            synthetic_weights,
+            synthetic_metrics,
+        ) = synthetic_outputs
 
-    fixes = len(scored)
-    anomalous_rate = scored["is_anomaly"].mean()
-    reference_animals = scored.loc[scored["label"] == 0, "animal_id"].nunique()
-    comparison_animals = scored.loc[scored["label"] == 1, "animal_id"].nunique()
-    animal_flags = animal_level_flags(
-        scored,
-        animal_col="animal_id",
-        label_col="label",
-        flag_col="is_anomaly",
-        min_anomalous_fixes=min_anomalous_fixes,
-    )
-    animal_flags = animal_flags.merge(
-        scored[["animal_id", "species", "sex", "genotype"]].drop_duplicates(),
-        on="animal_id",
-        how="left",
-    )
-    animal_flags["anomalous_fix_rate"] = (
-        animal_flags["n_anomalous_fixes"] / animal_flags["n_fixes"]
-    )
-    animal_flags["predicted_status"] = np.where(
-        animal_flags["predicted_label"].eq(1),
-        "flagged animal",
-        "not flagged",
-    )
-    animal_metrics = row_level_metrics(
-        animal_flags["true_label"].astype(int).to_numpy(),
-        animal_flags["predicted_label"].astype(int).to_numpy(),
-    )
-    animals_flagged = int(animal_flags["predicted_label"].sum())
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Reference Animals", f"{reference_animals:,}")
-    c2.metric("Comparison Animals", f"{comparison_animals:,}")
-    c3.metric("GPS Fixes", f"{fixes:,}")
-    c4.metric("Anomaly Threshold", f"{model_metrics['threshold']:.3f}")
-    c5.metric("Flagged Fix Rate", f"{anomalous_rate:.1%}")
-    c6.metric("Animals Flagged", f"{animals_flagged}/{len(animal_flags)}")
-
-    tab_model, tab_animals, tab_contributions, tab_quality, tab_methods = st.tabs(
+    tab_features, tab_model, tab_results, tab_demo, tab_methods = st.tabs(
         [
-            "ML Model",
-            "Animal Flags",
-            "Feature Contributions",
-            "Telemetry Quality",
+            "Movement Features",
+            "Model Learning",
+            "Results Explorer",
+            "Synthetic Demo",
             "Methods",
         ]
     )
 
+    with tab_features:
+        show_feature_tab(profile_name, feature_columns, processed)
+
     with tab_model:
-        st.subheader("Autoencoder-Style Reconstruction Model")
-        st.markdown(
-            """
-            The dashboard now runs the core modeling idea instead of using a placeholder score:
-
-            1. Train only on synthetic reference animals.
-            2. Reconstruct movement features from held-out telemetry rows.
-            3. Calculate total squared reconstruction error for each GPS fix.
-            4. Freeze the anomaly threshold from reference validation animals.
-            5. Evaluate row-level and animal-level flags on the selected synthetic cohort.
-            """
+        show_model_tab(
+            profile_name,
+            threshold_info,
+            id_rule,
+            history,
+            weight_summary,
+            synthetic_metrics,
+            synthetic_weights,
         )
 
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Reference Train Animals", f"{model_metrics['reference_train_animals']:,}")
-        p2.metric(
-            "Reference Validation Animals",
-            f"{model_metrics['reference_validation_animals']:,}",
-        )
-        p3.metric("Latent Width", f"{model_metrics['latent_width']}")
-        p4.metric("Training Iterations", f"{model_metrics['model_iterations']:,}")
+    with tab_results:
+        show_results_tab(rows, id_summary, contribution, synthetic_scored, synthetic_contrib)
 
-        fig = px.histogram(
-            scored,
-            x="reconstruction_error",
-            color="label_name",
-            nbins=50,
-            title="Reconstruction Error Distribution",
-            labels={"reconstruction_error": "total squared reconstruction error"},
-        )
-        fig.add_vline(
-            x=model_metrics["threshold"],
-            line_dash="dash",
-            line_color="red",
-            annotation_text=f"{threshold_percentile}th pct threshold",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        sweep_fig = px.line(
-            threshold_sweep,
-            x="percentile",
-            y=["flagged_fix_rate", "balanced_accuracy", "sensitivity", "specificity"],
-            markers=True,
-            title="Threshold Slider Sensitivity",
-            labels={"value": "metric value", "percentile": "reference validation percentile"},
-        )
-        sweep_fig.add_vline(
-            x=threshold_percentile,
-            line_dash="dash",
-            line_color="red",
-            annotation_text="current slider",
-        )
-        sweep_fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(sweep_fig, use_container_width=True)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Sensitivity", f"{model_metrics['sensitivity_recall']:.2f}")
-        m2.metric("Specificity", f"{model_metrics['specificity']:.2f}")
-        m3.metric("Precision", f"{model_metrics['precision']:.2f}")
-        m4.metric("Balanced Accuracy", f"{model_metrics['balanced_accuracy']:.2f}")
-
-        cm = confusion_matrix(
-            scored["label"].astype(int).to_numpy(),
-            scored["is_anomaly"].astype(int).to_numpy(),
-            labels=[0, 1],
-        )
-        cm_df = pd.DataFrame(
-            cm,
-            index=["Actual reference", "Actual comparison"],
-            columns=["Predicted reference", "Predicted anomaly"],
-        )
-        st.dataframe(cm_df, use_container_width=True)
-        st.caption(
-            "Synthetic label 0 means reference movement and synthetic label 1 means comparison "
-            "movement. These metrics demonstrate the workflow shape, not a biological result."
-        )
-
-    with tab_animals:
-        st.subheader("Animal-Level Flags")
+    with tab_demo:
+        st.subheader("Reduced Synthetic ML Demo")
         st.write(
-            f"Current rule: an animal is flagged when it has at least "
-            f"{min_anomalous_fixes} anomalous GPS fixes."
+            "This section exists only so the public repo can be run without protected data. "
+            "It trains a small reconstruction model on synthetic reference animals and shows "
+            "the same inspection pattern used by the manuscript artifact viewer."
         )
-
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Animals Flagged", f"{animals_flagged}/{len(animal_flags)}")
-        a2.metric("Animal Sensitivity", f"{animal_metrics['sensitivity_recall']:.2f}")
-        a3.metric("Animal Specificity", f"{animal_metrics['specificity']:.2f}")
-        a4.metric("Animal Balanced Accuracy", f"{animal_metrics['balanced_accuracy']:.2f}")
-
-        fig = px.bar(
-            animal_flags.sort_values("n_anomalous_fixes", ascending=False),
-            x="animal_id",
-            y="n_anomalous_fixes",
-            color="predicted_status",
-            title="Animal-Level Calls Driven by the Minimum-Fixes Slider",
-            labels={"predicted_status": "animal call"},
-        )
-        fig.add_hline(
-            y=min_anomalous_fixes,
-            line_dash="dash",
-            line_color="red",
-            annotation_text="animal flag rule",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(animal_flags, use_container_width=True)
-
-    with tab_contributions:
-        st.subheader("Feature Contributions to Reconstruction Error")
-        st.write(
-            "This mirrors the publication-style residual summary: calculate squared residuals "
-            "for each reconstructed feature, then express each feature's mean residual as a "
-            "percentage of total reconstruction error."
-        )
-
-        contrib_long = feature_contribution.melt(
-            id_vars="feature",
-            value_vars=[
-                "flagged_contribution_pct",
-                "comparison_contribution_pct",
-                "all_rows_contribution_pct",
-            ],
-            var_name="row_subset",
-            value_name="contribution_pct",
-        )
-        subset = st.radio(
-            "Contribution subset",
-            [
-                "flagged_contribution_pct",
-                "comparison_contribution_pct",
-                "all_rows_contribution_pct",
-            ],
-            horizontal=True,
-        )
-        plot_df = (
-            contrib_long[contrib_long["row_subset"] == subset]
-            .sort_values("contribution_pct", ascending=True)
-            .copy()
-        )
-        fig = px.bar(
-            plot_df,
-            x="contribution_pct",
-            y="feature",
-            orientation="h",
-            title="Mean Squared Residual Contribution by Feature",
-            labels={"contribution_pct": "contribution to reconstruction error (%)"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(feature_contribution, use_container_width=True)
-        st.caption(
-            "Feature contributions identify which movement dimensions contributed most to "
-            "reconstruction error. They are model residual summaries, not causal effects."
-        )
-
-    with tab_quality:
-        st.subheader("Telemetry Data Quality")
-        scored["date"] = pd.to_datetime(scored["timestamp"]).dt.date
-        daily_counts = (
-            scored.groupby(["animal_id", "date", "species", "label_name"])
-            .size()
-            .reset_index(name="fixes_per_day")
-        )
-
-        q1, q2 = st.columns([1, 1])
-        with q1:
-            fig = px.histogram(
-                daily_counts,
-                x="fixes_per_day",
-                color="species",
-                barmode="group",
-                title="Fixes per Animal-Day",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        with q2:
-            retention = (
-                daily_counts.assign(retained=lambda x: x["fixes_per_day"] >= 2)
-                .groupby(["species", "label_name"])["retained"]
-                .mean()
-                .reset_index()
-            )
-            fig = px.bar(
-                retention,
-                x="species",
-                y="retained",
-                color="label_name",
-                text_auto=".1%",
-                title="Demo Retention Rate: At Least 2 Fixes per Day",
-            )
-            fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
-
-        st.dataframe(
-            daily_counts.groupby(["species", "label_name"])["fixes_per_day"]
-            .describe()
-            .reset_index(),
-            use_container_width=True,
-        )
-
-        st.subheader("Movement Feature Explorer")
-        feature = st.selectbox(
-            "Feature",
-            [
-                "speed_m_per_hour",
-                "step_distance_m",
-                "turning_angle_deg",
-                "rolling_3_speed_mean",
-                "rolling_3_step_mean_m",
-            ],
-        )
-
-        f1, f2 = st.columns([1, 1])
-        with f1:
-            fig = px.histogram(
-                scored,
-                x=feature,
-                color="label_name",
-                marginal="box",
-                nbins=45,
-                title=f"{feature} Distribution",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        with f2:
-            fig = px.box(
-                scored,
-                x="species",
-                y=feature,
-                color="label_name",
-                points=False,
-                title=f"{feature} by Species and Label",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        st.dataframe(
-            scored.groupby(["species", "sex", "genotype", "label_name"])[feature]
-            .describe()
-            .reset_index(),
-            use_container_width=True,
-        )
+        if synthetic_outputs is None:
+            st.info("Synthetic fallback is disabled or could not run.")
+        else:
+            show_synthetic_metrics(synthetic_scored, synthetic_sweep, synthetic_metrics)
 
     with tab_methods:
-        st.subheader("Methods and Reproducibility")
-        st.markdown(
-            "\n".join(
-                [
-                    "This public dashboard is built around the controls required "
-                    "for the research workflow:",
-                    "",
-                    "- train and validate by animal ID, not only by GPS row;",
-                    "- fit preprocessing on reference/training data before applying it elsewhere;",
-                    "- reconstruct movement features and score total squared residual error;",
-                    "- freeze the anomaly threshold before final evaluation;",
-                    "- report row-level and animal-level results separately;",
-                    "- inspect feature-level residual contributions for model interpretation;",
-                    "- keep raw telemetry and unpublished labels out of GitHub.",
-                    "",
-                    "The Streamlit dashboard uses a scikit-learn MLP reconstruction model so "
-                    "the public demo remains lightweight and easy to run. The protected "
-                    "research workflow uses TensorFlow/Keras autoencoders with the study "
-                    "telemetry, frozen feature columns, saved scalers, and held-out cohorts.",
-                ]
-            )
+        st.subheader("Dashboard Role")
+        st.write(
+            "The dashboard is deliberately secondary. The portfolio proof is the manuscript "
+            "pipeline: preprocessing, saved feature order, autoencoder training, frozen "
+            "thresholds, animal-level rules, and residual contribution tables."
         )
-
-        st.subheader("Public Demo vs. Research Workflow")
         st.dataframe(
             pd.DataFrame(
                 [
                     {
-                        "component": "data",
-                        "public_dashboard": "synthetic telemetry",
-                        "research_workflow": "protected cervid GPS telemetry",
+                        "layer": "manuscript scripts",
+                        "purpose": "faithful public-safe port of mule deer and WTD workflows",
                     },
                     {
-                        "component": "model",
-                        "public_dashboard": "scikit-learn MLP reconstruction model",
-                        "research_workflow": "TensorFlow/Keras autoencoder",
+                        "layer": "artifact viewer",
+                        "purpose": (
+                            "load local pkl/csv/npy/h5 outputs from synthetic or protected runs"
+                        ),
                     },
                     {
-                        "component": "threshold",
-                        "public_dashboard": "reference validation percentile",
-                        "research_workflow": "frozen threshold from training/validation design",
-                    },
-                    {
-                        "component": "interpretation",
-                        "public_dashboard": "feature residual contribution percentages",
-                        "research_workflow": "holdout residuals and animal-level review",
+                        "layer": "synthetic demo",
+                        "purpose": "small fallback only for screenshots and public reproducibility",
                     },
                 ]
             ),
