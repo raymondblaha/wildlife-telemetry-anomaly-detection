@@ -17,6 +17,14 @@ This repository refactors research notebooks and R Markdown workflows into a rep
 
 This is a public-facing project scaffold. The original research notebooks are being refactored into reusable scripts and modules. Raw GPS coordinates, exact animal IDs, agency file paths, and unpublished split manifests are intentionally excluded.
 
+## Publication Provenance
+
+The mule deer anomaly-detection pipeline represented in this repository was developed to support the peer-reviewed Movement Ecology publication:
+
+Blaha, R. L. et al. (2026). [Use of deep learning to predict chronic wasting disease status based on animal movement](https://link.springer.com/article/10.1186/s40462-026-00668-4). Movement Ecology, 14, Article 57.
+
+This public repository is not a raw-data release for that study. Instead, it presents a privacy-conscious, reproducible version of the workflow concepts: telemetry cleaning, movement-feature engineering, animal-level validation, frozen-threshold anomaly detection, and public-safe dashboarding.
+
 ## Project Layout
 
 ```text
