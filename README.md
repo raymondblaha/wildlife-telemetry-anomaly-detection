@@ -24,7 +24,7 @@ This public repository is not a raw-data release for either study. Instead, it d
 - Autoencoder anomaly detection using frozen preprocessing, frozen feature order, and a threshold selected before final test evaluation.
 - Row-level and animal-level reporting so model metrics are not confused with independent biological replicates.
 - Cross-species and genotype-transfer experiment design without publishing sensitive raw telemetry.
-- A dashboard layer for inspecting telemetry quality, feature distributions, threshold behavior, and animal-level anomaly calls using synthetic data.
+- A dashboard layer for inspecting autoencoder-style reconstruction error, feature residual contributions, and animal-level anomaly calls using synthetic data.
 
 ## Intended Workflow
 
@@ -43,11 +43,12 @@ The Streamlit dashboard is a supporting inspection layer, not the centerpiece of
 
 It is designed to show:
 
-- telemetry data-quality review before modeling;
-- movement-feature exploration by species, sex, genotype, and label;
-- reconstruction-error threshold behavior;
+- a lightweight autoencoder-style reconstruction model trained on synthetic reference animals;
+- reconstruction-error scoring and frozen validation-threshold behavior;
+- feature residual contribution percentages, mirroring the publication-style review logic;
 - row-level model metrics;
-- animal-level anomaly summaries.
+- animal-level anomaly summaries;
+- telemetry quality and movement-feature review before modeling.
 
 Run from the repository root:
 
@@ -56,7 +57,7 @@ python scripts/generate_sample_data.py
 streamlit run dashboard/app.py
 ```
 
-For the strongest ML/CWD framing in portfolio materials, use a screenshot from the **Threshold Review** or **Animal Review** tab rather than leading with the Feature Explorer tab.
+For the strongest ML/CWD framing in portfolio materials, use a screenshot from the **ML Model**, **Feature Contributions**, or **Animal Flags** tab rather than leading with the Telemetry Quality view.
 
 ## Project Layout
 
