@@ -6,6 +6,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+build/
+*.egg-info/
 
 # R
 .Rhistory
@@ -17,6 +19,7 @@ venv/
 data/raw/
 data/interim/
 data/processed/
+data/sample/manuscript_synthetic/
 outputs/
 models/
 *.h5
