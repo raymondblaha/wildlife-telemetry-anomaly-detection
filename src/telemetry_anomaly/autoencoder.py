@@ -18,8 +18,15 @@ class Threshold:
     metadata: dict[str, float | int | str] = field(default_factory=dict)
 
 
-def build_dense_autoencoder(input_dim: int, latent_dim: int = 8):
-    """Build a compact TensorFlow/Keras dense autoencoder."""
+def build_dense_autoencoder(
+    input_dim: int,
+    latent_dim: int = 4,
+    *,
+    hidden_dims: tuple[int, int] = (32, 16),
+    l2_weight: float = 1e-4,
+    learning_rate: float = 1e-4,
+):
+    """Build the dense autoencoder architecture used by the manuscript notebooks."""
 
     try:
         import tensorflow as tf
@@ -29,16 +36,38 @@ def build_dense_autoencoder(input_dim: int, latent_dim: int = 8):
             "Install with `pip install .[deep-learning]`."
         ) from exc
 
+    regularizer = tf.keras.regularizers.l2(l2_weight)
     inputs = tf.keras.Input(shape=(input_dim,))
-    encoded = tf.keras.layers.Dense(64, activation="relu")(inputs)
-    encoded = tf.keras.layers.Dense(32, activation="relu")(encoded)
-    encoded = tf.keras.layers.Dense(latent_dim, activation="relu", name="latent")(encoded)
-    decoded = tf.keras.layers.Dense(32, activation="relu")(encoded)
-    decoded = tf.keras.layers.Dense(64, activation="relu")(decoded)
+    encoded = tf.keras.layers.Dense(
+        hidden_dims[0],
+        activation="relu",
+        kernel_regularizer=regularizer,
+    )(inputs)
+    encoded = tf.keras.layers.Dense(
+        hidden_dims[1],
+        activation="relu",
+        kernel_regularizer=regularizer,
+    )(encoded)
+    encoded = tf.keras.layers.Dense(
+        latent_dim,
+        activation="relu",
+        kernel_regularizer=regularizer,
+        name="bottleneck",
+    )(encoded)
+    decoded = tf.keras.layers.Dense(
+        hidden_dims[1],
+        activation="relu",
+        kernel_regularizer=regularizer,
+    )(encoded)
+    decoded = tf.keras.layers.Dense(
+        hidden_dims[0],
+        activation="relu",
+        kernel_regularizer=regularizer,
+    )(decoded)
     outputs = tf.keras.layers.Dense(input_dim, activation="linear")(decoded)
 
     model = tf.keras.Model(inputs, outputs, name="telemetry_autoencoder")
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss="mse")
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss="mse")
     return model
 
 
@@ -259,3 +288,4 @@ def flag_anomalies(errors: np.ndarray, threshold: Threshold | float) -> np.ndarr
 
     value = threshold.value if isinstance(threshold, Threshold) else float(threshold)
     return errors > value
+
