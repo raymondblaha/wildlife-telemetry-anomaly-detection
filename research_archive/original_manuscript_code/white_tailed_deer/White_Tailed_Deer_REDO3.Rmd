@@ -1,0 +1,4233 @@
+---
+title: "White-Tailed Deer Preprocessing"
+author: "Raymond"
+date: "2025-09-25"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load in libraries
+library(moveHMM)
+citation("moveHMM")
+packageVersion("moveHMM")
+library(tidyverse)
+citation("tidyverse")
+packageVersion("tidyverse")
+library(lubridate)
+citation("lubridate")
+packageVersion("lubridate")
+library(ggplot2)
+citation("ggplot2")
+packageVersion("ggplot2")
+library(sf)
+citation("sf")
+packageVersion("sf")
+library(sp)
+citation("sp")
+packageVersion("sp")
+library(leaflet)
+library(adehabitatHR)
+citation("adehabitatHR")
+packageVersion("adehabitatHR")
+library(adehabitatLT)
+citation("adehabitatLT")
+packageVersion("adehabitatLT")
+library(moveHMM)
+citation("moveHMM")
+packageVersion("moveHMM")
+library(lme4)
+citation("lme4")
+packageVersion("lme4")
+library(Matrix)
+citation("Matrix")
+packageVersion("Matrix")
+library(glmmTMB)
+citation("glmmTMB")
+packageVersion("glmmTMB")
+library(plotly)
+citation("plotly")
+packageVersion("plotly")
+library(momentuHMM)
+# install.packages("readxl")         # once
+library(readxl)
+
+```
+
+```{r}
+# Load the data with tab separator
+# see what sheets exist (optional)
+excel_sheets("<LOCAL_PATH>")
+
+# read the first (or named) sheet
+deer_data <- read_excel(
+  path = "<LOCAL_PATH>",
+  sheet = 1,              # or "SheetName"
+  .name_repair = "unique" # make duplicate column names unique
+)
+
+# Check for missing values in critical columns
+sum(is.na(deer_data$AID)) # Good
+sum(is.na(deer_data$Latitude)) # 32 missing values
+sum(is.na(deer_data$Longitude)) #32 missing values
+sum(is.na(deer_data$DOP)) #Good
+sum(is.na(deer_data$Date_Time)) #Good
+# Count unique AIDs
+length(unique(deer_data$AID))
+
+# Convert DATE_TIME to POSIXct
+deer_data$datetime <- as.POSIXct(deer_data$Date_Time, format="%m/%d/%Y %H:%M")
+
+# Check structure of the data
+str(deer_data)
+
+# Clean rows where LATITUDE or LONGITUDE are NA
+deer_data_clean <- deer_data %>%
+  filter(!is.na(Latitude) & !is.na(Longitude))
+
+# Verify that the DOP column is still present
+if(!"DOP" %in% colnames(deer_data_clean)) {
+  stop("DOP column is missing after cleaning.")
+}
+
+# Ensure LATITUDE, LONGITUDE, and DOP are numeric
+deer_data_clean <- deer_data_clean %>%
+  mutate(
+    LATITUDE = as.numeric(Latitude),
+    LONGITUDE = as.numeric(Longitude),
+    DOP = as.numeric(DOP)
+  )
+
+# Create sf object while keeping the DOP column
+deer_data_clean_sf <- st_as_sf(
+  deer_data_clean, 
+  coords = c("Longitude", "Latitude"), 
+  crs = 4326, remove=FALSE
+)
+
+# Transform to UTM Zone 13N (EPSG:32613)
+deer_data_clean_utm <- st_transform(deer_data_clean_sf, crs = 32613)
+
+# Extract UTM coordinates and add them as new columns
+deer_data_clean <- deer_data_clean %>%
+  mutate(
+    UTM_EASTING = st_coordinates(deer_data_clean_utm)[,1],
+    UTM_NORTHING = st_coordinates(deer_data_clean_utm)[,2]
+  )
+
+# Inspect cleaned data
+head(deer_data_clean)
+
+# Check structure to ensure DOP is preserved
+str(deer_data_clean)
+# Check the data type of AID
+class(deer_data_clean$AID)
+
+# Count unique AIDs
+length(unique(deer_data_clean$AID))
+
+# Count unique non-missing AIDs
+n_distinct(deer_data_clean$AID, na.rm = TRUE)
+```
+
+```{r}
+# Transform back to WGS84 (EPSG:4326) for Leaflet compatibility
+deer_data_clean_wgs <- st_transform(deer_data_clean_utm, crs = 4326)
+
+# Verify with a sample plot using leaflet
+leaflet(data = deer_data_clean_wgs) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    radius = 3,
+    color = ~ifelse(DOP < 10, "blue", "red"),
+    label = ~paste("ID:", AID, "<br>", "DOP:", DOP)
+  ) %>%
+  addLegend(
+    "bottomright", 
+    colors = c("blue", "red"),
+    labels = c("DOP < 10", "DOP >= 10"),
+    title = "DOP Quality"
+  )
+
+
+```
+
+```{r}
+# Ensure UTM Coordinates Exist in `deer_filtered`
+deer_filtered <- deer_data_clean_utm %>% 
+  filter(DOP < 10) %>% 
+  mutate(
+    UTM_EASTING = st_coordinates(.)[,1],
+    UTM_NORTHING = st_coordinates(.)[,2]
+  )
+
+# Inspect DOP Distribution
+hist(deer_filtered$DOP, main="DOP Distribution After Filtering", xlab="DOP")
+
+```
+
+```{r}
+# Visualize After Filtering
+ggplot(deer_filtered) +
+  geom_sf(aes(color = DOP), size=1) +
+  scale_color_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  labs(
+    title = "Filtered Mule Deer Data by DOP",
+    x = "Easting", y = "Northing", color = "DOP"
+  )
+
+```
+
+```{r}
+# Extract Coordinates
+deer_coords <- st_coordinates(deer_filtered) %>% as.data.frame()
+
+# Drop Geometry and Extract Relevant Columns
+deer_filtered_df <- deer_filtered %>%
+  st_drop_geometry() %>%
+  mutate(
+    X = round(UTM_EASTING, 4), 
+    Y = round(UTM_NORTHING, 4)
+  )
+
+# Inspect Data
+head(deer_filtered_df)
+```
+
+
+```{r}
+## Checking number of AIDs for column addition for Male and Female
+length(unique(deer_filtered_df$AID))
+
+library(readxl)
+library(dplyr)
+library(stringr)
+
+# 🔹 1) List all yearly files
+paths <- c(
+  "<LOCAL_PATH>",
+  "<LOCAL_PATH>",
+  "<LOCAL_PATH>",
+  "<LOCAL_PATH>",
+  "<LOCAL_PATH>"
+)
+
+# 🔹 2) Helper to read ONE file using header-detect logic + add year
+read_status_file <- function(status_path) {
+  
+  tmp <- readxl::read_excel(status_path, col_names = FALSE)
+
+  header_row <- which(apply(tmp, 1, function(r) {
+    any(grepl("\\bAID\\b|Animal\\s*ID|Deer\\s*ID", r, ignore.case = TRUE))
+  }))[1]
+
+  if (is.na(header_row)) {
+    stop(paste("Couldn't find AID-like header in:", status_path))
+  }
+
+  status <- readxl::read_excel(status_path, skip = header_row - 1)
+  nms <- names(status)
+
+  aid_col <- nms[grepl(
+    "^AID$|Animal\\s*ID|Deer\\s*ID|^aid$|animal_?id|deer_?id",
+    nms,
+    ignore.case = TRUE
+  )][1]
+
+  sex_col <- nms[grepl(
+    "^Sex$|^sex$",
+    nms,
+    ignore.case = TRUE
+  )][1]
+
+  cwd_col <- nms[grepl(
+    "CWD\\s*Status|CWD.*Result|^Status$|^Result$|cwd.*status|cwd.*result",
+    nms,
+    ignore.case = TRUE
+  )][1]
+
+  if (any(is.na(c(aid_col, cwd_col)))) {
+    stop(paste0(
+      "Couldn't auto-detect AID or CWD Status in: ", status_path,
+      "\nColumns detected: ", paste(nms, collapse = " | ")
+    ))
+  }
+
+  year <- as.integer(stringr::str_extract(basename(status_path), "\\b20\\d{2}\\b"))
+
+  status_clean <- tolower(as.character(status[[cwd_col]]))
+
+  status_norm <- dplyr::case_when(
+    stringr::str_detect(status_clean, "pos|positive|detect|detected|reactor") ~ "positive",
+    stringr::str_detect(status_clean, "suspect|suspicious")                  ~ "suspect",
+    stringr::str_detect(status_clean, "neg|negative|not.*detected|nd")       ~ "negative",
+    TRUE                                                                     ~ status_clean
+  )
+
+  tibble::tibble(
+    AID        = stringr::str_trim(as.character(status[[aid_col]])),
+    Sex        = if (!is.na(sex_col)) as.character(status[[sex_col]]) else NA_character_,
+    cwd_status = status_norm,
+    year       = year
+  )
+}
+
+# 🔹 3) Read all years and combine
+status_all <- dplyr::bind_rows(lapply(paths, read_status_file))
+
+# Normalize and keep only IDs like A00 / F00 / F000
+status_all <- status_all %>%
+  dplyr::mutate(
+    AID = as.character(AID) |>
+      stringr::str_to_upper() |>
+      stringr::str_replace_all("[^A-Z0-9]", ""),
+    is_id_like = stringr::str_detect(AID, "^[AF][0-9]{2,3}$")
+  ) %>%
+  dplyr::filter(AID != "", is_id_like) %>%
+  dplyr::select(-is_id_like)
+
+# Normalize movement dataframe AID before joining
+deer_filtered_df <- deer_filtered_df %>%
+  dplyr::mutate(
+    AID = as.character(AID) |>
+      stringr::str_to_upper() |>
+      stringr::str_replace_all("[^A-Z0-9]", "")
+  )
+
+# 🔹 4) Choose FINAL status per AID
+# Rule: latest year wins; if same year has multiple rows, prefer higher severity.
+severity_rank <- function(x) {
+  dplyr::case_when(
+    x == "positive" ~ 3L,
+    x == "suspect"  ~ 2L,
+    x == "negative" ~ 1L,
+    TRUE            ~ 0L
+  )
+}
+
+status_final <- status_all %>%
+  dplyr::mutate(sev = severity_rank(cwd_status)) %>%
+  dplyr::arrange(AID, dplyr::desc(year), dplyr::desc(sev)) %>%
+  dplyr::group_by(AID) %>%
+  dplyr::slice_head(n = 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    AID,
+    `CWD Status` = cwd_status,
+    year_final = year
+  )
+
+# 🔹 5) Choose stable Sex per AID
+# Prefer Sex from latest year with a non-NA value.
+sex_latest <- status_all %>%
+  dplyr::filter(!is.na(Sex) & stringr::str_trim(Sex) != "") %>%
+  dplyr::arrange(AID, dplyr::desc(year)) %>%
+  dplyr::group_by(AID) %>%
+  dplyr::summarise(
+    Sex_latest = dplyr::first(Sex),
+    .groups = "drop"
+  )
+
+# Fallback: most frequent Sex per AID
+sex_mode <- status_all %>%
+  dplyr::filter(!is.na(Sex) & stringr::str_trim(Sex) != "") %>%
+  dplyr::group_by(AID, Sex) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::arrange(AID, dplyr::desc(n)) %>%
+  dplyr::group_by(AID) %>%
+  dplyr::slice_head(n = 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(AID, Sex_mode = Sex)
+
+sex_final <- sex_latest %>%
+  dplyr::full_join(sex_mode, by = "AID") %>%
+  dplyr::mutate(
+    Sex = dplyr::if_else(
+      !is.na(Sex_latest),
+      Sex_latest,
+      Sex_mode
+    )
+  ) %>%
+  dplyr::select(AID, Sex)
+
+# 🔹 6) Merge final status + sex
+status_final2 <- status_final %>%
+  dplyr::left_join(sex_final, by = "AID") %>%
+  dplyr::select(AID, Sex, `CWD Status`, year_final)
+
+# Join to movement data
+deer_filtered_df <- deer_filtered_df %>%
+  dplyr::left_join(status_final2, by = "AID")
+
+# 🔹 7) QA
+cat("Unique AIDs in movement data: ", dplyr::n_distinct(deer_filtered_df$AID), "\n")
+cat("AIDs with any status record:   ", dplyr::n_distinct(status_all$AID), "\n")
+cat("AIDs with final status:        ", dplyr::n_distinct(status_final2$AID), "\n")
+cat(
+  "Rows missing Sex/CWD Status:   ",
+  sum(is.na(deer_filtered_df$Sex) | is.na(deer_filtered_df$`CWD Status`)),
+  "\n"
+)
+
+# Which AIDs in movement lack any status across years?
+missing_status_aids <- setdiff(
+  unique(deer_filtered_df$AID),
+  unique(status_final2$AID)
+)
+
+cat("\nFirst 20 movement AIDs missing statu<LOCAL_PATH>")
+print(head(missing_status_aids, 20))
+
+# Print final AID status table
+aid_status <- status_final2 %>%
+  dplyr::select(AID, `CWD Status`, year_final, Sex) %>%
+  dplyr::arrange(AID)
+
+print(aid_status, n = Inf)
+
+# Optional checks
+print(status_final2)
+print(colnames(status_final2))
+print(deer_filtered_df)
+
+```
+
+```{r}
+# Coverage summaries
+aid_coverage <- deer_filtered_df %>%
+  summarise(
+    n_rows            = n(),
+    n_ids_total       = n_distinct(AID),
+    n_ids_with_status = n_distinct(AID[!is.na(`CWD Status`)]),
+    n_ids_without     = n_ids_total - n_ids_with_status,
+    pct_with_status   = round(100 * n_ids_with_status / n_ids_total, 1)
+  )
+aid_coverage
+
+status_counts <- deer_filtered_df %>%
+  distinct(AID, `CWD Status`, Sex) %>%
+  count(`CWD Status`, sort = TRUE)
+status_counts
+
+status_by_sex <- deer_filtered_df %>%
+  distinct(AID, `CWD Status`, Sex) %>%
+  count(Sex, `CWD Status`, sort = TRUE)
+status_by_sex
+
+# One row per AID (final status)
+aid_status_unique <- deer_filtered_df %>%
+  distinct(AID, `CWD Status`, Sex)
+
+# Find AIDs with ISF or Unknown-like statuses
+aid_isf_unknown <- aid_status_unique %>%
+  mutate(
+    status_chr = tolower(trimws(as.character(`CWD Status`))),
+    is_isf     = str_detect(status_chr, "\\bisf\\b|insufficient|inadequate"),
+    is_unknown = str_detect(status_chr, "^unknown\\*?$|\\bunknown\\b|^unk\\b")
+  ) %>%
+  filter(is_isf | is_unknown) %>%
+  arrange(AID)
+
+# Summary count
+cat("Total AIDs with ISF or Unknown-like status:", n_distinct(aid_isf_unknown$AID), "\n")
+
+aid_isf_unknown %>%
+  dplyr::select(AID, `CWD Status`, Sex) %>%
+  dplyr::arrange(AID) %>%
+  print(n = Inf)
+
+
+```
+
+```{r}
+library(readr)
+# IDs to drop
+ids_to_drop <- c("A35","A42","F01","F86","F44","F80", "A37")
+
+#A35 = M
+#A42 = M
+#F01 = F
+#F84 = F
+#F44 = F
+#F80 = F
+#A37 = M
+
+# Before/after counts (movement data)
+cat("Unique AIDs before:", n_distinct(deer_filtered_df$AID), "\n")
+
+deer_filtered_df <- deer_filtered_df %>%
+  filter(!AID %in% ids_to_drop)
+
+cat("Unique AIDs after: ", n_distinct(deer_filtered_df$AID), "\n")
+
+deer_filtered_df
+
+out_path <- "<LOCAL_PATH>"
+# write_csv(deer_filtered_df, out_path)
+colnames(deer_filtered_df)
+cat("✅ Saved", nrow(deer_filtered_df), "rows to:", out_path, "\n")
+
+```
+
+```{r}
+library(tidyverse)
+library(amt)
+library(sf)
+library(adehabitatLT)
+library(ctmm)
+library(patchwork)
+library(tidyterra)
+
+## Set ggplot theme
+theme_set(theme_bw())
+
+## Write function to subset and convert to ltraj
+# Will need this for segmenting migration
+lv_func <- function(x, id_, lmin=30) {
+  
+  # Subset by ID
+  temp <- x |> 
+    # Filter by ID
+    filter(id==id_) |>
+    # Select only columns we need to converting back to ltraj
+    dplyr::select(id:date) |>
+    # Convert to data.frame
+    as.data.frame() |>
+    # Make date a POSIX-formatted column
+    mutate(date = as.POSIXct(date, tz="America/Denver"))
+  
+  # Convert to ltraj
+  ltr <- as.ltraj(xy=temp[,c("x","y")], date=temp$date, id=temp$id)
+  
+  # Run lavielle
+  lv <- lavielle(ltr, Lmin=lmin, which="R2n", Kmax=10, plotit=TRUE)
+  
+  k_try <- chooseseg(lv, S=0.75, output="opt", draw=TRUE)
+  
+  print("Optimal breaks by chooseseg():")
+  print(k_try)
+  
+  # Plot and segment with select value of breaks
+  fp <- findpath(lv, k_try)
+  
+  # Take input from the console on number of breaks
+  print("Enter number of breaks:")
+  k <- scan(n = 1)
+  
+  # Plot and segment with select value of breaks
+  fp <- findpath(lv, k)
+  
+  # Convert to data frame
+  df <- ld(fp)
+  # remove some columns we don't need (i.e. match pigs_res)
+  df <- df |> as_tibble() |>
+    # reorder columns
+    dplyr::select(id, x:rel.angle, burst) |>
+    # Remove extra characters ("Segment.") so that we only have a number in the burst column
+    mutate(burst=gsub("Segment.", "", burst)) |>
+    # Combine ID with the segment number
+    unite(key, c("id", "burst"), sep="_", remove=FALSE) |>
+    # Reorder columns
+    dplyr::select(id, key, x:rel.angle)
+  
+  # Return segmented data
+  return(df)
+}
+
+#### Deer ####
+# Read in deer location data
+deer <- read_csv("<LOCAL_PATH>", show_col_types = FALSE) %>%
+  # build a proper timestamp from existing datetime columns
+  mutate(
+    timestamp = dplyr::coalesce(
+      # prefer 'datetime' if present
+      if ("datetime" %in% names(.)) with_tz(datetime, "America/Chicago") else as.POSIXct(NA),
+      # else fallback to 'Date_Time'
+      if ("Date_Time" %in% names(.)) with_tz(as_datetime(Date_Time), "America/Chicago") else as.POSIXct(NA)
+    ),
+    month = month(timestamp),
+    year  = year(timestamp),
+    DeerID = as.character(AID),
+    study  = as.character(GroupYr),
+    # prefer existing X/Y; else UTM; else Lon/Lat
+    X = dplyr::coalesce(
+      if ("X" %in% names(.)) as.numeric(X) else NA_real_,
+      if ("UTM_EASTING"  %in% names(.)) as.numeric(UTM_EASTING) else NA_real_,
+      if ("Longitude"    %in% names(.)) as.numeric(Longitude) else NA_real_
+    ),
+    Y = dplyr::coalesce(
+      if ("Y" %in% names(.)) as.numeric(Y) else NA_real_,
+      if ("UTM_NORTHING" %in% names(.)) as.numeric(UTM_NORTHING) else NA_real_,
+      if ("Latitude"     %in% names(.)) as.numeric(Latitude) else NA_real_
+    )
+  ) %>%
+  select(DeerID, study, month, year, timestamp, X, Y)
+
+deer |> group_by(study) |> reframe(range=range(timestamp))
+
+# Create track of all individuals
+deer_tr <- make_track(deer, X, Y, timestamp, id=DeerID, crs=32616)
+
+# Check sampling rate of all individuals
+trk_info <- deer_tr |> summarize_sampling_rate_many(c("id"), time_unit="min")
+
+# List individual IDs
+un.id <- unique(deer$DeerID)
+
+## Loop over each ID and: 
+# 1. Resample to every 3 hours
+# 2. Calculate step lengths (and find median)
+# 3. Check patchiness of location data
+# 4. Determine whether individuals are moving ranges throughout the year
+# 5. Build ctmm home range
+# 6. Extract available points from home range
+
+
+#### 1. and 2. Run loop to resample and calculate step lengths ####
+deer_res <- tibble()
+tr_sum   <- tibble()
+
+for (i in seq_along(un.id)) {
+  # RAW fixes for this ID (no resampling, no regularization)
+  dat <- deer_tr %>%
+    filter(id == un.id[i]) %>%
+    arrange(t_)
+  if (nrow(dat) < 2) next
+  
+  # (optional) sampling-rate summary
+  s <- dat %>% summarize_sampling_rate_many(c("id"), time_unit = "hour")
+  tr_sum <- bind_rows(tr_sum, s)
+  
+  # ltraj from raw coords/times
+  df_raw <- as.data.frame(dat)
+  ltr    <- as.ltraj(xy = df_raw[, c("x_", "y_")], date = df_raw$t_, id = df_raw$id)
+  
+  # Extract step metrics
+  df_out <- ld(ltr) %>%
+    as_tibble()
+  
+  # If R2n missing, add it as net squared displacement from first point of each burst
+  if (!"R2n" %in% names(df_out) || all(is.na(df_out$R2n))) {
+    df_out <- df_out %>%
+      group_by(id, burst) %>%
+      mutate(
+        x0  = first(x[!is.na(x)]),
+        y0  = first(y[!is.na(y)]),
+        R2n = (x - x0)^2 + (y - y0)^2
+      ) %>%
+      ungroup() %>%
+      select(-x0, -y0)
+  }
+  
+  # Keep the same column set you used before (this includes R2n now)
+  df_out <- df_out %>%
+    dplyr::select(id, x:rel.angle)
+  
+  deer_res <- bind_rows(deer_res, df_out)
+}
+
+tr_sum <- as_tibble(tr_sum)
+
+deer0 <- read_csv("<LOCAL_PATH>", show_col_types = FALSE)
+deer0
+
+deer_res
+deer0
+
+## Check distribution of how far they move in 4 hours
+quantile(deer_res$dist, probs=c(0.9, 0.95, 0.99), na.rm=TRUE)
+
+# Filter 99th percentiles
+deer_res <- deer_res |> filter(dist < (1852.130*2))
+
+tr_sum <- as_tibble(tr_sum)
+deer_res
+deer0
+# Check
+hist(deer_res$dist)
+
+
+#### 3. Determine which animals need to be split ####
+deer_res <- as_tibble(deer_res)
+un.id <- unique(deer_res$id)
+## Look through plots and manually list which IDs probably will need to be segmented, as well as those that might need to be filtered by dates to remove patchy data
+for (i in 1:length(un.id)) {
+  
+  temp <- deer_res |> filter(id==un.id[i])
+  
+  p1 <- ggplot(temp, aes(x=x, y=y, color=date)) +
+    geom_path() + geom_point() +
+    ggtitle(un.id[i])
+  
+  p2 <- ggplot(temp, aes(x=date, y=R2n, color=date)) +
+    geom_path()
+  
+  print(p1 / p2)
+  
+}
+# 1) Snapshot BEFORE filtering (copy current pre-filter deer_res here)
+deer_res0 <- as_tibble(deer_res) %>% mutate(.rid = row_number())
+
+# 2) Re-apply filters starting from deer_res0 (so we can measure deltas)
+df <- deer_res0
+
+# Cut out the migratory movement in the middle. 
+# Double check the spiky points
+
+# A44 cut the left
+
+
+## Filter 
+# Come back to F31
+df <- df |> filter(id!="A44" | (id=="A44" & x>420000)) #Remove Left 
+df <- df |> filter(id!="F107" | (id=="F107" & x>421000)) #Remove Left 
+df <- df |> filter(id!="F48" | (id=="F48" & x<418500)) #Remove Right
+df <- df |> filter(id!="A41" | (id=="A41" & x<425500)) #Remove Right
+df <- df |> filter(id!="A40" | (id=="A40" & x<425000)) #Remove Right
+df <- df |> filter(id!="A39" | (id=="A39" & x<426500)) #Remove Right
+df <- df |> filter(id!="F100" | (id=="F100" & x<505000)) #Remove Right
+y0 <- 4732000
+
+n_before <- nrow(df)
+df <- df %>%
+  filter(!(id == "F93" & !is.na(y) & y <= y0))
+cat("Removed", n_before - nrow(df), "rows (F293 with y ≤", y0, ")\n") #Remove Under
+df <- df |> filter(id!="A58" | (id=="A58" & x>400000)) #Remove Left 
+y0 <- 4740000  
+n_before <- nrow(df)
+
+df <- df %>%
+  filter(!(id == "A51" & !is.na(y) & y > y0))
+
+cat("Removed", n_before - nrow(df), "rows (A51 with y >", y0, ")\n") #Remove Above
+df <- df |> filter(id!="A51" | (id=="A51" & x<460000)) #Remove Right
+
+df <- df |> filter(id!="F44" | (id=="F44" & x>420000)) #Remove Left 
+df <- df |> filter(id!="F78" | (id=="F78" & x>414000)) #Remove Left 
+df <- df |> filter(id!="F78" | (id=="F78" & x<419000)) #Remove Right
+y0 <- 4738000
+
+n_before <- nrow(df)
+df <- df %>%
+  filter(!(id == "F27" & !is.na(y) & y <= y0))
+cat("Removed", n_before - nrow(df), "rows (F27 with y ≤", y0, ")\n") #Remove Under
+
+df <- df |> filter(id!="A53" | (id=="A53" & x>410000)) #Remove Left
+df <- df |> filter(id!="A52" | (id=="A52" & x>405000)) #Remove Left
+df <- df |> filter(id!="A50" | (id=="A50" & x<460000)) #Remove Right
+df <- df |> filter(id!="A47" | (id=="A47" & x<460000)) #Remove Right
+y0 <- 4744000  
+n_before <- nrow(df)
+
+df <- df %>%
+  filter(!(id == "A47" & !is.na(y) & y > y0))
+
+cat("Removed", n_before - nrow(df), "rows (A47 with y >", y0, ")\n") #Remove Above
+df <- df |> filter(id!="A45" | (id=="A45" & x>400000)) #Remove Left
+df <- df |> filter(id!="F109" | (id=="F109" & x<440000)) #Remove Right
+df <- df |> filter(id!="F109" | (id=="F109" & x>420000)) #Remove Left
+df <- df |> filter(id!="F97" | (id=="F97" & x<460000)) #Remove Right
+df <- df |> filter(id!="F94" | (id=="F94" & x<450000)) #Remove Right
+y0 <- 4710000  
+n_before <- nrow(df)
+
+df <- df %>%
+  filter(!(id == "F91" & !is.na(y) & y > y0))
+
+cat("Removed", n_before - nrow(df), "rows (F91 with y >", y0, ")\n") #Remove Above
+y0 <- 4743000 
+n_before <- nrow(df)
+
+df <- df %>%
+  filter(!(id == "F42" & !is.na(y) & y > y0))
+
+cat("Removed", n_before - nrow(df), "rows (F42 with y >", y0, ")\n") #Remove Above
+y0 <- 4600000
+
+n_before <- nrow(df)
+df <- df %>%
+  filter(!(id == "A41" & !is.na(y) & y <= y0))
+cat("Removed", n_before - nrow(df), "rows (A41 with y ≤", y0, ")\n") #Remove Under
+df <- df |> filter(id!="A36" | (id=="A36" & x<440000)) #Remove Right
+
+# 3) Compute removals
+removed <- anti_join(deer_res0, df, by = ".rid")
+total_removed <- nrow(removed)
+total_before  <- nrow(deer_res0)
+total_after   <- nrow(df)
+
+cat("Total before:", total_before, "\n")
+cat("Total after :", total_after,  "\n")
+cat("Removed     :", total_removed, sprintf("(%.2f%%)\n", 100*total_removed/total_before))
+
+# 4) By-ID breakdown of removed rows
+removed_by_id <- removed %>% count(id, name = "removed_n") %>% arrange(desc(removed_n))
+print(removed_by_id, n = 50)
+
+# 5) (Optional) Keep the filtered result
+deer_res <- df %>% select(-.rid)
+
+
+# out_path <- "<LOCAL_PATH>"
+# write_csv(deer_res, out_path)
+# 
+# cat("✅ Saved", nrow(deer_res), "rows to:", out_path, "\n")
+# colnames(deer_res)
+
+
+```
+
+```{r}
+# ============================================================
+# AFTER YOU COMPUTE df AS YOUR FILTERED DATA
+# This locks in the manually removed points
+# ============================================================
+
+library(dplyr)
+library(readr)
+library(lubridate)
+library(janitor)
+library(ggplot2)
+library(patchwork)
+
+# ------------------------------------------------------------
+# 1) Compute removals
+# ------------------------------------------------------------
+
+removed <- anti_join(deer_res0, df, by = ".rid")
+
+total_removed <- nrow(removed)
+total_before  <- nrow(deer_res0)
+total_after   <- nrow(df)
+
+cat("Total before:", total_before, "\n")
+cat("Total after :", total_after,  "\n")
+cat("Removed     :", total_removed, sprintf("(%.2f%%)\n", 100 * total_removed / total_before))
+
+removed_by_id <- removed %>%
+  count(id, name = "removed_n") %>%
+  arrange(desc(removed_n))
+
+print(removed_by_id, n = 50)
+
+# ------------------------------------------------------------
+# 2) Final filtered resident data
+# IMPORTANT: this is the object everything below must use
+# ------------------------------------------------------------
+
+deer_res <- df %>%
+  select(-.rid)
+
+out_path <- "<LOCAL_PATH>"
+
+write_csv(deer_res, out_path)
+
+cat("✅ Saved", nrow(deer_res), "rows to:", out_path, "\n")
+
+# ============================================================
+# ENRICH ONLY THE FILTERED DATA
+# Do NOT go back to deer_res0 or old objects
+# ============================================================
+
+# ------------------------------------------------------------
+# 3) Normalize filtered deer_res
+# ------------------------------------------------------------
+
+deer_res_norm <- deer_res %>%
+  mutate(
+    id = trimws(as.character(id)),
+    date = as.POSIXct(
+      format(as.POSIXct(date, tz = "UTC"), "%Y-%m-%d %H:%M:%S"),
+      tz = "UTC"
+    ),
+    x = round(as.numeric(x), 4),
+    y = round(as.numeric(y), 4)
+  )
+
+# ------------------------------------------------------------
+# 4) Normalize original metadata table
+# ------------------------------------------------------------
+
+deer_filtered_norm <- deer_filtered_df %>%
+  mutate(
+    AID = trimws(as.character(AID)),
+    
+    Date_Time = dplyr::coalesce(
+      if (inherits(datetime, "POSIXt")) {
+        as.POSIXct(datetime, tz = "UTC")
+      } else {
+        as.POSIXct(NA)
+      },
+      suppressWarnings(as.POSIXct(Date_Time, tz = "UTC"))
+    ),
+    
+    Date_Time = as.POSIXct(
+      format(Date_Time, "%Y-%m-%d %H:%M:%S"),
+      tz = "UTC"
+    ),
+    
+    X = round(as.numeric(X), 4),
+    Y = round(as.numeric(Y), 4)
+  )
+
+# ------------------------------------------------------------
+# 5) Columns to bring over
+# ------------------------------------------------------------
+
+cols_to_add <- c(
+  "FixNum",
+  "GroupYr",
+  "Latitude",
+  "Longitude",
+  "Altitude",
+  "FixStatus",
+  "NumSats",
+  "DOP",
+  "LATITUDE",
+  "LONGITUDE",
+  "UTM_EASTING",
+  "UTM_NORTHING",
+  "Sex",
+  "CWD Status",
+  "year_final"
+)
+
+# ------------------------------------------------------------
+# 6) Enrich filtered data only
+# ------------------------------------------------------------
+
+deer_res_joined <- deer_res_norm %>%
+  left_join(
+    deer_filtered_norm %>%
+      select(AID, Date_Time, X, Y, any_of(cols_to_add)),
+    by = c(
+      "id" = "AID",
+      "date" = "Date_Time",
+      "x" = "X",
+      "y" = "Y"
+    )
+  )
+
+# ------------------------------------------------------------
+# 7) Diagnostics
+# ------------------------------------------------------------
+
+n_total <- nrow(deer_res_norm)
+
+n_matched <- sum(
+  !is.na(deer_res_joined$GroupYr) |
+    !is.na(deer_res_joined$Sex) |
+    !is.na(deer_res_joined$FixNum)
+)
+
+cat("Joined rows matched:", n_matched, "of", n_total,
+    sprintf("(%.2f%%)\n", 100 * n_matched / max(1, n_total)))
+
+cat("Rows after join:", nrow(deer_res_joined), "\n")
+
+if (nrow(deer_res_joined) != nrow(deer_res)) {
+  warning("The join changed the row count. That means duplicate matches may exist in deer_filtered_df.")
+}
+
+# ============================================================
+# SAFETY CHECK:
+# Make sure removed rows are NOT in deer_res_joined
+# ============================================================
+
+removed_check <- removed %>%
+  mutate(
+    id = trimws(as.character(id)),
+    date = as.POSIXct(
+      format(as.POSIXct(date, tz = "UTC"), "%Y-%m-%d %H:%M:%S"),
+      tz = "UTC"
+    ),
+    x = round(as.numeric(x), 4),
+    y = round(as.numeric(y), 4)
+  ) %>%
+  semi_join(
+    deer_res_joined,
+    by = c("id", "date", "x", "y")
+  )
+
+cat("Removed points still present after join:", nrow(removed_check), "\n")
+
+if (nrow(removed_check) > 0) {
+  print(
+    removed_check %>%
+      select(id, date, x, y) %>%
+      arrange(id, date),
+    n = Inf
+  )
+  
+  stop("Some manually removed points are still present. The filtered object was not used correctly.")
+}
+
+# ============================================================
+# SAVE FILTERED + ENRICHED DATA
+# ============================================================
+
+write_csv(
+  deer_res_joined,
+  "<LOCAL_PATH>"
+)
+
+# ============================================================
+# RECALCULATE MOVEMENT COLUMNS AFTER FILTERING
+# ============================================================
+
+deer_recalc <- deer_res_joined %>%
+  clean_names() %>%
+  mutate(
+    id = as.character(id),
+    
+    date = parse_date_time(
+      as.character(date),
+      orders = c(
+        "ymd HMS",
+        "ymd HM",
+        "ymd",
+        "mdy HMS",
+        "mdy HM",
+        "mdy"
+      ),
+      tz = "UTC"
+    )
+  ) %>%
+  arrange(id, date)
+
+# ------------------------------------------------------------
+# Choose coordinate columns
+# ------------------------------------------------------------
+
+coord_x <- "utm_easting"
+coord_y <- "utm_northing"
+
+# If UTM columns are missing or NA, use x/y instead:
+# coord_x <- "x"
+# coord_y <- "y"
+
+# ------------------------------------------------------------
+# Recalculate movement
+# ------------------------------------------------------------
+
+deer_recalc <- deer_recalc %>%
+  group_by(id) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    fix_num_recalc = row_number(),
+    
+    x_prev = lag(.data[[coord_x]]),
+    y_prev = lag(.data[[coord_y]]),
+    date_prev = lag(date),
+    
+    dx_recalc = .data[[coord_x]] - x_prev,
+    dy_recalc = .data[[coord_y]] - y_prev,
+    
+    dist_recalc = sqrt(dx_recalc^2 + dy_recalc^2),
+    
+    dt_recalc = as.numeric(difftime(date, date_prev, units = "hours")),
+    
+    speed_m_per_hr = dist_recalc / dt_recalc,
+    
+    abs_angle_recalc = atan2(dy_recalc, dx_recalc),
+    
+    rel_angle_recalc = abs_angle_recalc - lag(abs_angle_recalc),
+    rel_angle_recalc = atan2(
+      sin(rel_angle_recalc),
+      cos(rel_angle_recalc)
+    ),
+    
+    x_start = first(.data[[coord_x]]),
+    y_start = first(.data[[coord_y]]),
+    
+    r2n_recalc = (.data[[coord_x]] - x_start)^2 +
+      (.data[[coord_y]] - y_start)^2,
+    
+    net_displacement_km = sqrt(r2n_recalc) / 1000
+  ) %>%
+  ungroup()
+
+deer_for_classification <- deer_recalc %>%
+  mutate(
+    dx = dx_recalc,
+    dy = dy_recalc,
+    dist = dist_recalc,
+    dt = dt_recalc,
+    abs_angle = abs_angle_recalc,
+    rel_angle = rel_angle_recalc,
+    r2n = r2n_recalc,
+    fix_num = fix_num_recalc
+  )
+
+# ============================================================
+# PLOT FROM deer_for_classification ONLY
+# ============================================================
+
+deer_tracks <- deer_for_classification %>%
+  clean_names() %>%
+  mutate(
+    id = as.character(id),
+    
+    date = parse_date_time(
+      as.character(date),
+      orders = c(
+        "ymd HMS",
+        "ymd HM",
+        "ymd",
+        "mdy HMS",
+        "mdy HM",
+        "mdy"
+      ),
+      tz = "UTC"
+    )
+  ) %>%
+  filter(
+    !is.na(.data[[coord_x]]),
+    !is.na(.data[[coord_y]]),
+    !is.na(id),
+    !is.na(date)
+  ) %>%
+  arrange(id, date)
+
+ids <- sort(unique(deer_tracks$id))
+
+cat("Number of unique IDs:", length(ids), "\n")
+print(ids)
+
+# ============================================================
+# Function: one deer ID track + R2n plot
+# ============================================================
+
+plot_deer_track_r2n <- function(deer_id) {
+  
+  deer_i <- deer_tracks %>%
+    filter(id == as.character(deer_id)) %>%
+    arrange(date)
+  
+  if (nrow(deer_i) == 0) {
+    stop(paste("No rows found for ID:", deer_id))
+  }
+  
+  n_fixes <- nrow(deer_i)
+  date_min <- min(deer_i$date, na.rm = TRUE)
+  date_max <- max(deer_i$date, na.rm = TRUE)
+  
+  cwd_label <- deer_i %>%
+    distinct(cwd_status) %>%
+    pull(cwd_status) %>%
+    paste(collapse = ", ")
+  
+  p_track <- ggplot(
+    deer_i,
+    aes(
+      x = .data[[coord_x]],
+      y = .data[[coord_y]]
+    )
+  ) +
+    geom_path(linewidth = 0.45, alpha = 0.75) +
+    geom_point(aes(color = date), size = 1.2, alpha = 0.85) +
+    coord_equal() +
+    labs(
+      title = paste("Deer ID", deer_id),
+      subtitle = paste0(
+        "CWD Status: ", cwd_label,
+        " | Fixes: ", n_fixes,
+        " | ", format(date_min, "%Y-%m-%d"),
+        " to ", format(date_max, "%Y-%m-%d")
+      ),
+      x = NULL,
+      y = NULL,
+      color = "Date"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(size = 10),
+      legend.position = "right"
+    )
+  
+  p_r2n <- ggplot(
+    deer_i,
+    aes(
+      x = date,
+      y = r2n
+    )
+  ) +
+    geom_line(linewidth = 0.45, alpha = 0.8, na.rm = TRUE) +
+    geom_point(size = 0.8, alpha = 0.65, na.rm = TRUE) +
+    labs(
+      title = "R2n over time",
+      x = "Date",
+      y = "R2n"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      panel.grid.minor = element_blank()
+    )
+  
+  combined_plot <- p_track / p_r2n +
+    plot_layout(heights = c(2.2, 1))
+  
+  return(combined_plot)
+}
+
+# ============================================================
+# Flip through all deer IDs
+# ============================================================
+
+for (deer_id in ids) {
+  print(plot_deer_track_r2n(deer_id))
+}
+
+# # Example single deer
+# p <- plot_deer_track_r2n("A44")
+# print(p)
+
+```
+
+#Review with Dr. B: 
+# Migratory:
+
+# Dispersal:
+
+# Wild: 
+
+# Resident: 
+
+
+# Classification: 
+#Migratory: F94, F91, F87, F74, F47, F30, F26, F103, A61, A60, A58, A57, A56, A49, A48, A44, A29, 
+
+#Dispersal: F99, F83, F62, F107, F106, A59, A55, A52, A45, A41, A38, A62,
+
+#Wild: A51, A50, 
+
+#Resident: F97, F93, F82, F79, F78, F77, F76, F73, F67, F66, F48, F42, F34, F33, F31, F27, F109, F100, A63, A54, A53, A47, A46, A43, A40, A39, A36, F04
+
+# Count unique AIDs
+# length(unique(deer_tracks$id))
+# 
+# colnames(deer_tracks)
+# 
+# 
+# summary(deer_tracks$utm_easting)
+# summary(deer_tracks$utm_northing)
+# summary(deer_tracks$date)
+# head(deer_for_classification$date)
+# aes(x = date, y = r2n)
+# names(deer_tracks)
+# deer_tracks
+# stop_here
+
+#Zoom in option for manual classifications
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+
+plot_deer_track_r2n <- function(deer_id, data = deer_tracks) {
+  
+  deer_i <- data %>%
+    mutate(id = trimws(as.character(id))) %>%
+    filter(id == trimws(as.character(deer_id))) %>%
+    arrange(date)
+  
+  cat("Rows found:", nrow(deer_i), "\n")
+  if (nrow(deer_i) == 0) stop("no rows found for this ID")
+  
+  if (!"fix_num" %in% names(deer_i)) {
+    deer_i <- deer_i %>% mutate(fix_num = row_number())
+  }
+  
+  if (!"migration_status" %in% names(deer_i)) {
+    deer_i <- deer_i %>% mutate(migration_status = "Unlabeled")
+  }
+  
+  deer_i <- deer_i %>%
+    mutate(
+      r2n = as.numeric(r2n),
+      net_displacement_km = sqrt(r2n) / 1000
+    )
+  
+  # ---- top plot (movement track) ----
+  p1 <- ggplot(deer_i, aes(
+    x = utm_easting,
+    y = utm_northing,
+    color = migration_status,
+    text = paste(
+      "Date:", date,
+      "<br>Fix:", fix_num,
+      "<br>Status:", migration_status
+    )
+  )) +
+    geom_path(size = 0.7, alpha = 0.85) +
+    coord_equal() +
+    labs(
+      title = paste("Tracks for ID", deer_id),
+      x = NULL, y = NULL,
+      color = "Status"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    )
+  
+  # ---- bottom plot (displacement) ----
+  p2 <- ggplot(deer_i, aes(
+    x = fix_num,
+    y = net_displacement_km,
+    color = migration_status,
+    text = paste(
+      "Date:", date,
+      "<br>R2n:", round(r2n, 2),
+      "<br>Net Displacement (km):", round(net_displacement_km, 2),
+      "<br>Status:", migration_status
+    )
+  )) +
+    geom_line(size = 0.4, alpha = 0.7) +
+    geom_point(size = 1.3, alpha = 0.85) +
+    labs(
+      title = "R2n / Net displacement",
+      x = "Fix #", y = "Net Displacement (km)",
+      color = "Status"
+    ) +
+    theme_minimal()
+  
+  # Convert both ggplots to plotly
+  p1_int <- plotly::ggplotly(p1, tooltip = "text")
+  p2_int <- plotly::ggplotly(p2, tooltip = "text")
+  
+  # Stack vertically (like patchwork)
+  fig <- subplot(
+    p1_int, p2_int,
+    nrows = 2,
+    heights = c(0.6, 0.4),
+    shareX = FALSE,
+    titleY = TRUE
+  )
+  
+  fig
+}
+
+plot_deer_track_r2n("A58")
+
+stop_here
+
+```
+
+# Split everything here and then continue to follow the inital Mule deer processing.
+
+```{r}
+# ============================================================
+# Split each deer ID into its own Excel file for manual labeling
+# ============================================================
+
+library(dplyr)
+library(janitor)
+library(lubridate)
+library(openxlsx)
+library(fs)
+
+# ------------------------------------------------------------
+# 1. Clean names and prep data
+# ------------------------------------------------------------
+
+deer_split <- deer_res_joined %>%
+  clean_names() %>%
+  mutate(
+    id = as.character(id),
+    date = parse_date_time(
+      date,
+      orders = c(
+        "ymd HMS", "ymd HM", "ymd",
+        "mdy HMS", "mdy HM", "mdy"
+      )
+    )
+  ) %>%
+  arrange(id, date)
+
+# ------------------------------------------------------------
+# 2. Optional: add manual labeling columns
+# ------------------------------------------------------------
+# These are blank columns you can fill in Excel.
+
+deer_split <- deer_split %>%
+  mutate(
+    final_class = NA_character_,        # resident / migratory / dispersal
+    manual_phase = NA_character_,       # winter_range / summer_range / spring_migration / fall_migration / dispersal
+    keep_for_corridor = NA_character_,  # yes / no
+    manual_notes = NA_character_
+  )
+
+# ------------------------------------------------------------
+# 3. Create output directory
+# ------------------------------------------------------------
+
+out_dir <- "<LOCAL_PATH>"
+
+dir_create(out_dir)
+
+cat("Output directory created at:", out_dir, "\n")
+
+# ============================================================
+# 4. Export one Excel file per ID
+# ============================================================
+
+ids <- sort(unique(deer_split$id))
+
+for (deer_id in ids) {
+  
+  deer_i <- deer_split %>%
+    filter(id == deer_id) %>%
+    arrange(date)
+  
+  # Clean file-safe ID name
+  safe_id <- gsub("[^A-Za-z0-9_-]", "_", deer_id)
+  
+  out_file <- file.path(
+    out_dir,
+    paste0("deer_ID_", safe_id, "_manual_labeling.xlsx")
+  )
+  
+  wb <- createWorkbook()
+  
+  addWorksheet(wb, "track_data")
+  
+  writeData(
+    wb,
+    sheet = "track_data",
+    x = deer_i
+  )
+  
+  # Freeze top row
+  freezePane(
+    wb,
+    sheet = "track_data",
+    firstRow = TRUE
+  )
+  
+  # Add filter
+  addFilter(
+    wb,
+    sheet = "track_data",
+    rows = 1,
+    cols = 1:ncol(deer_i)
+  )
+  
+  # Auto column widths
+  setColWidths(
+    wb,
+    sheet = "track_data",
+    cols = 1:ncol(deer_i),
+    widths = "auto"
+  )
+  
+  saveWorkbook(
+    wb,
+    file = out_file,
+    overwrite = TRUE
+  )
+}
+
+cat("Finished exporting", length(ids), "Excel files to:", out_dir, "\n")
+
+```
+
+# Manual review here
+
+```{r}
+# ============================================================
+# Interactive Plotly track from one cleaned Excel sheet
+# Color by migration_status
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(janitor)
+library(lubridate)
+library(plotly)
+
+# ------------------------------------------------------------
+# 1. Choose Excel file
+# ------------------------------------------------------------
+
+file_path <- file.choose()
+
+deer_plot <- read_excel(file_path) %>%
+  clean_names()
+
+# ------------------------------------------------------------
+# 2. Parse columns
+# ------------------------------------------------------------
+
+deer_plot <- deer_plot %>%
+  mutate(
+    id = as.character(id),
+    date = parse_date_time(
+      date,
+      orders = c(
+        "ymd HMS", "ymd HM", "ymd",
+        "mdy HMS", "mdy HM", "mdy"
+      )
+    ),
+    migration_status = as.character(migration_status)
+  ) %>%
+  arrange(id, date)
+
+# ------------------------------------------------------------
+# 3. Pick coordinate columns
+# ------------------------------------------------------------
+
+coord_x <- "utm_easting"
+coord_y <- "utm_northing"
+
+# If your Excel file only has x/y instead, use:
+# coord_x <- "x"
+# coord_y <- "y"
+
+# ------------------------------------------------------------
+# 4. Clean plot data
+# ------------------------------------------------------------
+
+deer_plot <- deer_plot %>%
+  filter(
+    !is.na(.data[[coord_x]]),
+    !is.na(.data[[coord_y]]),
+    !is.na(date),
+    !is.na(migration_status)
+  )
+
+# ------------------------------------------------------------
+# 5. Interactive spatial track
+# ------------------------------------------------------------
+
+p_track <- plot_ly(
+  data = deer_plot,
+  x = ~.data[[coord_x]],
+  y = ~.data[[coord_y]],
+  type = "scatter",
+  mode = "lines+markers",
+  color = ~migration_status,
+  text = ~paste0(
+    "ID: ", id,
+    "<br>Date: ", date,
+    "<br>Migration status: ", migration_status,
+    "<br>R2n: ", r2n,
+    "<br>FixNum: ", fix_num
+  ),
+  hoverinfo = "text",
+  marker = list(size = 6),
+  line = list(width = 1)
+) %>%
+  layout(
+    title = "Interactive deer track by migration status",
+    xaxis = list(
+      title = "",
+      showticklabels = FALSE,
+      zeroline = FALSE
+    ),
+    yaxis = list(
+      title = "",
+      showticklabels = FALSE,
+      zeroline = FALSE,
+      scaleanchor = "x",
+      scaleratio = 1
+    ),
+    legend = list(title = list(text = "Migration status"))
+  )
+
+p_track
+
+```
+
+
+```{r}
+# =============================================================================
+# Deer spike reviewer — reproducible point removal tracker
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(shiny)
+library(readr)
+
+# ---- save directory ----------------------------------------------------------
+options(deer_cleaner.save_dir = "<LOCAL_PATH>")
+
+# ---- prep once for session ---------------------------------------------------
+# IMPORTANT: arrange first, then create stable row id
+deer_res_joined <- deer_res_joined %>%
+  arrange(id, date) %>%
+  mutate(.rid = row_number())
+
+# frozen original snapshot for reproducibility
+orig_data <- deer_res_joined
+
+ids_all <- sort(unique(deer_res_joined$id))
+
+# ---- UI ----------------------------------------------------------------------
+ui <- fluidPage(
+  titlePanel("Deer spike reviewer — click/select points to mark/remove"),
+
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("id", "ID", choices = ids_all),
+
+      actionButton("clear", "Clear current marks"),
+      actionButton("remove", "Remove marked from dataset", class = "btn-danger"),
+      actionButton("save_now", "Save current cleaned + removal log"),
+
+      hr(),
+
+      verbatimTextOutput("stats"),
+
+      helpText(
+        "Tip: Click a point in either plot to toggle mark. 
+        Box/lasso select points to toggle multiple marks. 
+        Marked points turn red. Removed points are logged permanently."
+      )
+    ),
+
+    mainPanel(
+      fluidRow(
+        column(6, plotlyOutput("xy_plot", height = 420)),
+        column(6, plotlyOutput("r2n_plot", height = 420))
+      ),
+
+      hr(),
+
+      h4("Currently marked points"),
+      tableOutput("marked_tbl"),
+
+      hr(),
+
+      h4("Removed points log"),
+      tableOutput("removed_tbl")
+    )
+  )
+)
+
+# ---- SERVER ------------------------------------------------------------------
+server <- function(input, output, session) {
+
+  rv <- reactiveValues(
+    data = deer_res_joined,              # working cleaned copy
+    marked = integer(),                  # currently selected .rid values
+    removed_rids = integer(),            # all removed .rid values
+    removed_log = tibble(),              # full removal log
+    removal_batch = 0                    # increments each time remove button is used
+  )
+
+  # ---- current ID data --------------------------------------------------------
+  cur <- reactive({
+    req(input$id)
+
+    rv$data %>%
+      filter(id == input$id) %>%
+      arrange(date) %>%
+      mutate(is_marked = .rid %in% rv$marked)
+  })
+
+  # ---- helper: save cleaned data and removed log ------------------------------
+  save_outputs <- function(reason = "manual") {
+
+    save_dir <- normalizePath(
+      getOption("deer_cleaner.save_dir", tempdir()),
+      winslash = "/",
+      mustWork = FALSE
+    )
+
+    if (!dir.exists(save_dir)) {
+      dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+    }
+
+    if (file.access(save_dir, 2) != 0) {
+      showNotification(
+        paste("Save dir not writable:", save_dir, "→ using tempdir()."),
+        type = "error"
+      )
+      save_dir <- tempdir()
+    }
+
+    ts <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+    clean_path <- file.path(
+      save_dir,
+      sprintf("deer_cleaned_%s_%s.csv", reason, ts)
+    )
+
+    removed_path <- file.path(
+      save_dir,
+      sprintf("deer_removed_log_%s_%s.csv", reason, ts)
+    )
+
+    # cleaned working dataset
+    tryCatch(
+      {
+        write_csv(rv$data, clean_path)
+      },
+      error = function(e) {
+        showNotification(
+          paste("Cleaned CSV save failed:", conditionMessage(e)),
+          type = "error"
+        )
+      }
+    )
+
+    # permanent removal log
+    tryCatch(
+      {
+        write_csv(rv$removed_log, removed_path)
+      },
+      error = function(e) {
+        showNotification(
+          paste("Removed-log CSV save failed:", conditionMessage(e)),
+          type = "error"
+        )
+      }
+    )
+
+    assign("deer_res_joined_cleaned", rv$data, envir = .GlobalEnv)
+    assign("deer_removed_log", rv$removed_log, envir = .GlobalEnv)
+
+    showNotification(
+      paste("Saved cleaned data and removal log to:", save_dir),
+      type = "message"
+    )
+  }
+
+  # ---- helper: toggle marks ---------------------------------------------------
+  toggle_rids <- function(rids) {
+    rids <- unique(as.integer(rids))
+    rids <- rids[!is.na(rids)]
+
+    if (!length(rids)) return()
+
+    to_add <- setdiff(rids, rv$marked)
+    to_remove <- intersect(rids, rv$marked)
+
+    rv$marked <- union(setdiff(rv$marked, to_remove), to_add)
+  }
+
+  # ---- clear current marks ----------------------------------------------------
+  observeEvent(input$clear, {
+    rv$marked <- integer()
+    showNotification("Cleared current marks.", type = "message")
+  })
+
+  # ---- remove marked points + permanently log them ----------------------------
+  observeEvent(input$remove, {
+
+    if (!length(rv$marked)) {
+      showNotification("No points are marked.", type = "warning")
+      return()
+    }
+
+    # only remove points that still exist in working data
+    marked_existing <- intersect(rv$marked, rv$data$.rid)
+
+    if (!length(marked_existing)) {
+      rv$marked <- integer()
+      showNotification("Marked points were already removed.", type = "warning")
+      return()
+    }
+
+    rv$removal_batch <- rv$removal_batch + 1
+    removal_time <- Sys.time()
+
+    removed_now <- orig_data %>%
+      filter(.rid %in% marked_existing) %>%
+      mutate(
+        removal_batch = rv$removal_batch,
+        removal_time = removal_time,
+        removed_by_app = TRUE
+      ) %>%
+      arrange(id, date)
+
+    rv$removed_log <- bind_rows(rv$removed_log, removed_now)
+    rv$removed_rids <- union(rv$removed_rids, marked_existing)
+
+    n_removed <- nrow(removed_now)
+
+    # update working dataset
+    rv$data <- rv$data %>%
+      filter(!.rid %in% marked_existing)
+
+    # clear marks after removal
+    rv$marked <- integer()
+
+    # refresh ID choices
+    new_ids <- sort(unique(rv$data$id))
+
+    updateSelectInput(
+      session,
+      "id",
+      choices = new_ids
+    )
+
+    if (length(new_ids) && !(input$id %in% new_ids)) {
+      updateSelectInput(
+        session,
+        "id",
+        selected = new_ids[1]
+      )
+    }
+
+    # save after each removal for reproducibility
+    save_outputs(reason = "auto_after_remove")
+
+    showNotification(
+      sprintf(
+        "Removed and logged %d point(s). Removal batch: %d.",
+        n_removed,
+        rv$removal_batch
+      ),
+      type = "message"
+    )
+  })
+
+  # ---- manual save button -----------------------------------------------------
+  observeEvent(input$save_now, {
+    save_outputs(reason = "manual")
+  })
+
+  # ---- click selection: XY plot ----------------------------------------------
+  observeEvent(event_data("plotly_click", source = "xy_src"), {
+    d <- event_data("plotly_click", source = "xy_src")
+
+    if (is.null(d) || is.null(d$customdata)) return()
+
+    toggle_rids(d$customdata)
+  }, ignoreInit = TRUE)
+
+  # ---- click selection: R2n plot ---------------------------------------------
+  observeEvent(event_data("plotly_click", source = "r2n_src"), {
+    d <- event_data("plotly_click", source = "r2n_src")
+
+    if (is.null(d) || is.null(d$customdata)) return()
+
+    toggle_rids(d$customdata)
+  }, ignoreInit = TRUE)
+
+  # ---- box/lasso selection: XY plot ------------------------------------------
+  observeEvent(event_data("plotly_selected", source = "xy_src"), {
+    d <- event_data("plotly_selected", source = "xy_src")
+
+    if (is.null(d) || is.null(d$customdata)) return()
+
+    toggle_rids(d$customdata)
+  }, ignoreInit = TRUE)
+
+  # ---- box/lasso selection: R2n plot -----------------------------------------
+  observeEvent(event_data("plotly_selected", source = "r2n_src"), {
+    d <- event_data("plotly_selected", source = "r2n_src")
+
+    if (is.null(d) || is.null(d$customdata)) return()
+
+    toggle_rids(d$customdata)
+  }, ignoreInit = TRUE)
+
+  # ---- XY plot ---------------------------------------------------------------
+  output$xy_plot <- renderPlotly({
+    df <- cur()
+
+    p <- ggplot(df, aes(x = x, y = y)) +
+      geom_path(color = "grey80") +
+      geom_point(
+        aes(
+          color = is_marked,
+          customdata = .rid,
+          text = paste0(
+            "ID: ", id,
+            "<br>Date: ", date,
+            "<br>.rid: ", .rid,
+            "<br>x: ", x,
+            "<br>y: ", y
+          )
+        ),
+        size = 1.8
+      ) +
+      scale_color_manual(
+        values = c(`FALSE` = "grey40", `TRUE` = "red"),
+        guide = "none"
+      ) +
+      coord_equal() +
+      labs(
+        title = paste("XY —", unique(df$id)),
+        x = "X",
+        y = "Y"
+      ) +
+      theme_minimal()
+
+    ggplotly(p, tooltip = "text", source = "xy_src") %>%
+      layout(
+        dragmode = "select",
+        clickmode = "event+select"
+      ) %>%
+      config(displayModeBar = TRUE)
+  })
+
+  # ---- R2n plot --------------------------------------------------------------
+  output$r2n_plot <- renderPlotly({
+    df <- cur()
+
+    p <- ggplot(df, aes(x = date, y = R2n)) +
+      geom_line(color = "grey80") +
+      geom_point(
+        aes(
+          color = is_marked,
+          customdata = .rid,
+          text = paste0(
+            "ID: ", id,
+            "<br>Date: ", date,
+            "<br>.rid: ", .rid,
+            "<br>R2n: ", R2n,
+            "<br>dist: ", dist,
+            "<br>FixStatus: ", FixStatus
+          )
+        ),
+        size = 1.8
+      ) +
+      scale_color_manual(
+        values = c(`FALSE` = "grey40", `TRUE` = "red"),
+        guide = "none"
+      ) +
+      labs(
+        title = "R2n over time",
+        x = "Time",
+        y = "R²n"
+      ) +
+      theme_minimal()
+
+    ggplotly(p, tooltip = "text", source = "r2n_src") %>%
+      layout(
+        dragmode = "select",
+        clickmode = "event+select"
+      ) %>%
+      config(displayModeBar = TRUE)
+  })
+
+  # ---- currently marked table ------------------------------------------------
+  output$marked_tbl <- renderTable({
+    if (!length(rv$marked)) {
+      return(tibble(
+        message = "No points currently marked."
+      ))
+    }
+
+    rv$data %>%
+      filter(.rid %in% rv$marked) %>%
+      arrange(id, date) %>%
+      select(
+        .rid,
+        id,
+        date,
+        x,
+        y,
+        dist,
+        R2n,
+        FixStatus
+      )
+  })
+
+  # ---- removed points table --------------------------------------------------
+  output$removed_tbl <- renderTable({
+    if (!nrow(rv$removed_log)) {
+      return(tibble(
+        message = "No points removed yet."
+      ))
+    }
+
+    rv$removed_log %>%
+      arrange(removal_batch, id, date) %>%
+      select(
+        removal_batch,
+        removal_time,
+        .rid,
+        id,
+        date,
+        x,
+        y,
+        dist,
+        R2n,
+        FixStatus
+      )
+  })
+
+  # ---- stats ----------------------------------------------------------------
+  output$stats <- renderText({
+    paste0(
+      "Original rows: ", nrow(orig_data),
+      "\nCurrent cleaned rows: ", nrow(rv$data),
+      "\nCurrent ID rows: ", nrow(cur()),
+      "\nCurrently marked: ", length(rv$marked),
+      "\nTotal removed: ", length(rv$removed_rids),
+      "\nRemoval batches: ", rv$removal_batch
+    )
+  })
+}
+
+# ---- Run app on localhost ----------------------------------------------------
+shinyApp(
+  ui,
+  server,
+  options = list(host = "127.0.0.1", port = 8080)
+)
+```
+
+```{r}
+df <- read_csv("<LOCAL_PATH>", show_col_types = FALSE)
+```
+
+
+
+```{r}
+df <- read_csv("<LOCAL_PATH>", show_col_types = FALSE)
+
+head(df)
+```
+
+## Sanity check here for making sure this is the correct file with the migratory instances gone
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(sf)
+
+# =============================================================================
+# LOAD FINAL MANUALLY CLEANED FILE
+# =============================================================================
+
+df <- read_csv(
+  "<LOCAL_PATH>",
+  show_col_types = FALSE
+)
+
+# =============================================================================
+# STANDARDIZE COLUMNS
+# =============================================================================
+# This assumes your coordinate columns are x/y and ID column is AID or id.
+# It will auto-handle either AID or id.
+
+df_plot <- df %>%
+  mutate(
+    deer_id = case_when(
+      "id"  %in% names(.) ~ as.character(id),
+      TRUE ~ NA_character_
+    ),
+    x = as.numeric(x),
+    y = as.numeric(y)
+  ) %>%
+  filter(
+    !is.na(deer_id),
+    !is.na(x),
+    !is.na(y)
+  )
+
+# Optional: detect date column if present
+date_candidates <- c("date", "datetime", "Date_Time", "timestamp", "time")
+
+date_col <- date_candidates[date_candidates %in% names(df_plot)][1]
+
+if (!is.na(date_col)) {
+  df_plot <- df_plot %>%
+    mutate(
+      ping_date = as.POSIXct(.data[[date_col]], tz = "UTC")
+    ) %>%
+    arrange(deer_id, ping_date)
+} else {
+  df_plot <- df_plot %>%
+    mutate(ping_date = NA)
+}
+
+cat("\nNumber of deer IDs:", n_distinct(df_plot$deer_id), "\n")
+cat("Total points:", nrow(df_plot), "\n")
+
+df_plot %>%
+  count(deer_id, name = "n_points") %>%
+  arrange(deer_id) %>%
+  print(n = Inf)
+```
+
+```{r}
+# =============================================================================
+# ONE DEER PER PAGE PDF
+# =============================================================================
+
+out_pdf <- "<LOCAL_PATH>"
+
+pdf(out_pdf, width = 9, height = 7)
+
+for (this_id in sort(unique(df_plot$deer_id))) {
+  
+  temp <- df_plot %>%
+    filter(deer_id == this_id)
+  
+  p <- ggplot(temp, aes(x = x, y = y)) +
+    geom_path(
+      aes(group = deer_id),
+      color = "gray60",
+      linewidth = 0.3,
+      alpha = 0.7
+    ) +
+    geom_point(
+      aes(color = ping_date),
+      size = 1.2,
+      alpha = 0.85
+    ) +
+    coord_equal() +
+    theme_minimal() +
+    labs(
+      title = paste("Cleaned GPS Points:", this_id),
+      subtitle = paste("n points =", nrow(temp)),
+      x = "X coordinate",
+      y = "Y coordinate",
+      color = "Date"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+  
+  print(p)
+}
+
+dev.off()
+
+cat("\nSaved per-deer manual check PD<LOCAL_PATH>", out_pdf, "\n")
+```
+
+```{r}
+# =============================================================================
+# OVERVIEW PLOT: ALL CLEANED POINTS
+# =============================================================================
+
+p_all <- ggplot(df_plot, aes(x = x, y = y, color = deer_id)) +
+  geom_point(alpha = 0.65, size = 0.7) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    title = "All Cleaned Deer GPS Points",
+    subtitle = "Final manually cleaned file before AKDE",
+    x = "X coordinate",
+    y = "Y coordinate",
+    color = "Deer ID"
+  ) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_all)
+
+ggsave(
+  filename = "<LOCAL_PATH>",
+  plot = p_all,
+  width = 12,
+  height = 9,
+  dpi = 300
+)
+```
+
+
+```{r}
+# ── Sliding-window AKDE per article seasonal seg_key ───────────────────────
+library(dplyr)
+library(sf)
+library(ctmm)
+library(lubridate)
+library(tibble)
+library(purrr)
+library(furrr)
+library(stringr)
+library(tidyr)
+library(readr)
+
+# =============================================================================
+# INPUT:
+# Use the article-cleaned dataset after migration-corridor removal
+# =============================================================================
+head(df)
+akde_input <- article_df
+
+# =============================================================================
+# Params
+# =============================================================================
+
+crs_utm     <- 32613
+win_days    <- 7
+step_days   <- 1
+min_fixes   <- 20
+tz_analysis <- "UTC"
+
+# =============================================================================
+# 0) Normalize article-based seasonal seg_key
+#
+# OLD:
+#   segmented_df
+#   burst
+#   seg_key = id_seg_burst
+#
+# NEW:
+#   akde_input
+#   hr_season = summer/winter
+#   hr_season_year = article home-range season year
+#   seg_key = id_year_season
+# =============================================================================
+
+akde_df <- akde_input %>%
+  filter(
+    !is.na(x),
+    !is.na(y),
+    !is.na(date),
+    !is.na(id),
+    !is.na(hr_season),
+    !is.na(hr_season_year)
+  ) %>%
+  mutate(
+    id = as.character(id),
+    hr_season = as.character(hr_season),
+    hr_season_year = as.integer(hr_season_year),
+    date = as.POSIXct(date, tz = tz_analysis),
+
+    # Article-based seasonal segment key
+    seg_key = paste(id, hr_season_year, hr_season, sep = "_"),
+
+    # Keep CWD / sex metadata if present
+    Sex = if ("Sex" %in% names(.)) as.character(Sex) else NA_character_,
+    `CWD Status` = if ("CWD Status" %in% names(.)) as.character(`CWD Status`) else NA_character_
+  ) %>%
+  arrange(seg_key, date)
+
+# QA
+cat("\nAKDE input by article seasonal seg_ke<LOCAL_PATH>")
+akde_df %>%
+  count(seg_key, id, hr_season_year, hr_season, name = "n_fixes") %>%
+  arrange(id, hr_season_year, hr_season) %>%
+  print(n = Inf)
+
+# Save exact AKDE input
+readr::write_csv(
+  akde_df,
+  file.path(ARTICLE_OUT_DIR, "akde_article_seasonal_input.csv")
+)
+
+# =============================================================================
+# 1) Build lon/lat for ctmm
+# ctmm::as.telemetry expects longitude/latitude
+# =============================================================================
+
+seg_sf <- akde_df %>%
+  st_as_sf(
+    coords = c("x", "y"),
+    crs = crs_utm,
+    remove = FALSE
+  ) %>%
+  st_transform(4326)
+
+ll <- st_coordinates(seg_sf) %>%
+  as_tibble() %>%
+  rename(
+    location.long = X,
+    location.lat = Y
+  )
+
+tele_df <- akde_df %>%
+  select(
+    seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    date,
+    Sex,
+    `CWD Status`
+  ) %>%
+  bind_cols(ll) %>%
+  transmute(
+    individual.local.identifier = seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    Sex,
+    `CWD Status`,
+    location.long,
+    location.lat,
+    timestamp = with_tz(date, tz_analysis)
+  )
+
+# =============================================================================
+# 2) Telemetry list keyed by article seasonal seg_key
+# =============================================================================
+
+tele_list <- ctmm::as.telemetry(
+  tele_df,
+  timeformat = "%Y-%m-%d %H:%M:%S",
+  timezone   = tz_analysis
+)
+
+names(tele_list) <- vapply(
+  tele_list,
+  function(x) x@info$identity,
+  character(1)
+)
+
+cat("\nTelemetry objects create<LOCAL_PATH>")
+print(length(tele_list))
+
+# Metadata table to join back later
+seg_metadata <- akde_df %>%
+  distinct(
+    seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    Sex,
+    `CWD Status`
+  )
+
+# =============================================================================
+# 3) Process one article seasonal seg_key
+# =============================================================================
+
+process_segkey <- function(seg_id) {
+
+  tel <- tele_list[[seg_id]]
+
+  if (is.null(tel) || nrow(tel) < min_fixes) {
+    return(list(area = tibble(), uds = list()))
+  }
+
+  # seconds
+  tmin   <- min(tel$t, na.rm = TRUE)
+  tmax   <- max(tel$t, na.rm = TRUE)
+  winlen <- as.numeric(win_days) * 24 * 3600
+  step   <- as.numeric(step_days) * 24 * 3600
+
+  # safety rails
+  if (!is.finite(tmin) || !is.finite(tmax) || !is.finite(winlen) || !is.finite(step)) {
+    return(list(area = tibble(), uds = list()))
+  }
+
+  if (step <= 0) {
+    stop("step_days must be > 0")
+  }
+
+  # If the seasonal segment is shorter than the window, skip
+  if ((tmax - tmin) < winlen) {
+    return(list(area = tibble(), uds = list()))
+  }
+
+  # Build window starts
+  last_start <- tmax - winlen
+
+  starts <- if (last_start >= tmin) {
+    seq(from = tmin, to = last_start, by = step)
+  } else {
+    numeric(0)
+  }
+
+  if (length(starts) == 0) {
+    return(list(area = tibble(), uds = list()))
+  }
+
+  area_rows <- tibble()
+  ud_list   <- list()
+
+  for (t0 in starts) {
+
+    t1 <- t0 + winlen
+
+    win <- tel[tel$t >= t0 & tel$t <= t1, ]
+
+    if (nrow(win) < min_fixes) next
+
+    UDw <- tryCatch(
+      {
+        v0 <- ctmm::variogram(win, CI = "Gauss")
+        vf <- ctmm::variogram.fit(v0, name = "GuessBM", interactive = FALSE)
+        m0 <- ctmm::ctmm.select(win, vf, IC = "BIC")
+        ctmm::akde(win, m0, weights = TRUE)
+      },
+      error = function(e) {
+        return(NULL)
+      }
+    )
+
+    if (is.null(UDw)) next
+
+    key <- paste0(seg_id, "___", as.integer(t0))
+    ud_list[[key]] <- UDw
+
+    ci <- tryCatch(
+      summary(UDw)$CI,
+      error = function(e) NULL
+    )
+
+    if (is.null(ci)) next
+
+    ci_tbl <- as_tibble(ci, rownames = "unit")
+
+    a <- ci_tbl %>%
+      dplyr::filter(startsWith(unit, "area")) %>%
+      dplyr::select(low, est, high)
+
+    if (nrow(a) == 0) next
+
+    area_rows <- dplyr::bind_rows(
+      area_rows,
+      tibble(
+        seg_key = seg_id,
+        window_start = as.POSIXct(t0, origin = "1970-01-01", tz = tz_analysis),
+        window_end   = as.POSIXct(t1, origin = "1970-01-01", tz = tz_analysis),
+        low = a$low,
+        est = a$est,
+        high = a$high
+      )
+    )
+  }
+
+  list(area = area_rows, uds = ud_list)
+}
+
+# =============================================================================
+# 4) Run in parallel
+# =============================================================================
+
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+seg_ids <- names(tele_list)
+
+seg_results <- furrr::future_map(
+  seg_ids,
+  process_segkey,
+  .progress = TRUE,
+  .options = furrr::furrr_options(seed = TRUE)
+)
+
+names(seg_results) <- seg_ids
+
+# =============================================================================
+# 5) Collect outputs
+# =============================================================================
+
+segwin_area_df <- purrr::map_dfr(seg_results, "area")
+
+segwin_ud_list_by_segkey <- purrr::map(seg_results, "uds")
+
+# Add article metadata back
+segwin_area_df <- segwin_area_df %>%
+  left_join(seg_metadata, by = "seg_key") %>%
+  arrange(id, hr_season_year, hr_season, window_start)
+
+# =============================================================================
+# 6) Area unit handling
+#
+# ctmm area units can vary depending on summary output.
+# First inspect values before converting.
+# =============================================================================
+
+cat("\nAKDE area output previe<LOCAL_PATH>")
+segwin_area_df %>%
+  select(seg_key, id, hr_season_year, hr_season, window_start, low, est, high) %>%
+  head(20) %>%
+  print()
+
+# If you confirm ctmm returns hectares, convert to km² like this:
+# segwin_area_df <- segwin_area_df %>%
+#   mutate(
+#     low_km2  = low / 100,
+#     est_km2  = est / 100,
+#     high_km2 = high / 100
+#   )
+
+# If values are already km², use:
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    low_km2  = low,
+    est_km2  = est,
+    high_km2 = high
+  )
+
+# =============================================================================
+# 7) Save and quick sanity checks
+# =============================================================================
+
+readr::write_csv(
+  segwin_area_df,
+  file.path(ARTICLE_OUT_DIR, "sliding_window_akde_area_by_article_season.csv")
+)
+
+cat("\nWindows per article seasonal seg_ke<LOCAL_PATH>")
+segwin_area_df %>%
+  group_by(seg_key, id, hr_season_year, hr_season) %>%
+  summarise(
+    n_windows = n(),
+    mean_est_km2 = mean(est_km2, na.rm = TRUE),
+    median_est_km2 = median(est_km2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_windows)) %>%
+  print(n = Inf)
+
+cat("\n✅ Sliding-window AKDE complete.\n")
+cat("Saved t<LOCAL_PATH>")
+cat(file.path(ARTICLE_OUT_DIR, "sliding_window_akde_area_by_article_season.csv"), "\n")
+
+segwin_area_df
+```
+
+## starting here again (reload everything)
+
+```{r}
+# =============================================================================
+# RELOAD SAVED SLIDING-WINDOW AKDE OUTPUTS
+# Use this when AKDE already ran and you do NOT want to rerun it
+# =============================================================================
+
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tibble)
+library(stringr)
+
+# -----------------------------------------------------------------------------
+# Params must match the AKDE run
+# -----------------------------------------------------------------------------
+ARTICLE_OUT_DIR <- "<LOCAL_PATH>"
+win_days    <- 7
+step_days   <- 1
+tz_analysis <- "UTC"
+
+# -----------------------------------------------------------------------------
+# Required paths
+# -----------------------------------------------------------------------------
+
+akde_input_path <- file.path(
+  ARTICLE_OUT_DIR,
+  "akde_article_seasonal_input.csv"
+)
+
+akde_area_path <- file.path(
+  ARTICLE_OUT_DIR,
+  "sliding_window_akde_area_by_article_season.csv"
+)
+
+# -----------------------------------------------------------------------------
+# Safety checks
+# -----------------------------------------------------------------------------
+
+if (!file.exists(akde_area_path)) {
+  stop(
+    "Could not find saved AKDE area fil<LOCAL_PATH>",
+    akde_area_path,
+    "\n\nYou may need to check ARTICLE_OUT_DIR or confirm the AKDE chunk finished saving."
+  )
+}
+
+if (!file.exists(akde_input_path)) {
+  warning(
+    "Could not find saved AKDE input fil<LOCAL_PATH>",
+    akde_input_path,
+    "\n\nContinuing with the AKDE area file only."
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Reload saved AKDE area output
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- readr::read_csv(
+  akde_area_path,
+  show_col_types = FALSE
+)
+
+# -----------------------------------------------------------------------------
+# Normalize date/time columns
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    window_start = as.POSIXct(window_start, tz = tz_analysis),
+    window_end = if ("window_end" %in% names(.)) {
+      as.POSIXct(window_end, tz = tz_analysis)
+    } else {
+      window_start + lubridate::days(win_days)
+    }
+  )
+
+# -----------------------------------------------------------------------------
+# Rebuild km2 columns if needed
+#
+# Your AKDE code treated low/est/high as already km²:
+#   low_km2  = low
+#   est_km2  = est
+#   high_km2 = high
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    low_km2  = if ("low_km2"  %in% names(.)) low_km2  else low,
+    est_km2  = if ("est_km2"  %in% names(.)) est_km2  else est,
+    high_km2 = if ("high_km2" %in% names(.)) high_km2 else high
+  )
+
+# -----------------------------------------------------------------------------
+# Reload AKDE input and metadata if available
+# This is useful if metadata columns were missing or got changed during save/load
+# -----------------------------------------------------------------------------
+
+if (file.exists(akde_input_path)) {
+
+  akde_df <- readr::read_csv(
+    akde_input_path,
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      id = as.character(id),
+      hr_season = as.character(hr_season),
+      hr_season_year = as.integer(hr_season_year),
+      date = as.POSIXct(date, tz = tz_analysis),
+      seg_key = as.character(seg_key)
+    )
+
+  seg_metadata <- akde_df %>%
+    distinct(
+      seg_key,
+      id,
+      hr_season_year,
+      hr_season,
+      Sex,
+      `CWD Status`
+    )
+
+  # Only join metadata columns if they are missing or incomplete
+  segwin_area_df <- segwin_area_df %>%
+    mutate(seg_key = as.character(seg_key)) %>%
+    select(
+      -any_of(c("id", "hr_season_year", "hr_season", "Sex", "CWD Status"))
+    ) %>%
+    left_join(seg_metadata, by = "seg_key")
+
+} else {
+
+  akde_df <- NULL
+
+  seg_metadata <- segwin_area_df %>%
+    distinct(
+      seg_key,
+      id,
+      hr_season_year,
+      hr_season,
+      Sex,
+      `CWD Status`
+    )
+}
+
+# -----------------------------------------------------------------------------
+# Final ordering
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- segwin_area_df %>%
+  arrange(id, hr_season_year, hr_season, window_start)
+
+# -----------------------------------------------------------------------------
+# QA: confirm reload worked
+# -----------------------------------------------------------------------------
+
+cat("\n✅ Reloaded saved sliding-window AKDE area output.\n")
+cat("File loaded fro<LOCAL_PATH>")
+cat(akde_area_path, "\n\n")
+
+cat("Rows loaded:", nrow(segwin_area_df), "\n")
+cat("Unique article seasonal seg_keys:", dplyr::n_distinct(segwin_area_df$seg_key), "\n\n")
+
+cat("Previe<LOCAL_PATH>")
+segwin_area_df %>%
+  select(
+    seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    window_start,
+    window_end,
+    low,
+    est,
+    high,
+    low_km2,
+    est_km2,
+    high_km2
+  ) %>%
+  head(20) %>%
+  print()
+
+cat("\nWindows per article seasonal seg_ke<LOCAL_PATH>")
+segwin_area_df %>%
+  group_by(seg_key, id, hr_season_year, hr_season) %>%
+  summarise(
+    n_windows = n(),
+    mean_est_km2 = mean(est_km2, na.rm = TRUE),
+    median_est_km2 = median(est_km2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_windows)) %>%
+  print(n = Inf)
+
+```
+
+# AKDE Exploration
+
+```{r}
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+library(tibble)
+
+AKDE_df <- read_csv(
+  "<LOCAL_PATH>",
+  show_col_types = FALSE
+)
+
+cat("\nColumn<LOCAL_PATH>")
+print(colnames(AKDE_df))
+
+cat("\nPrevie<LOCAL_PATH>")
+print(head(AKDE_df, 20))
+
+cat("\nSummary of raw AKDE area column<LOCAL_PATH>")
+AKDE_df %>%
+  summarise(
+    n_windows = n(),
+    low_min = min(low, na.rm = TRUE),
+    low_median = median(low, na.rm = TRUE),
+    low_mean = mean(low, na.rm = TRUE),
+    low_max = max(low, na.rm = TRUE),
+
+    est_min = min(est, na.rm = TRUE),
+    est_median = median(est, na.rm = TRUE),
+    est_mean = mean(est, na.rm = TRUE),
+    est_max = max(est, na.rm = TRUE),
+
+    high_min = min(high, na.rm = TRUE),
+    high_median = median(high, na.rm = TRUE),
+    high_mean = mean(high, na.rm = TRUE),
+    high_max = max(high, na.rm = TRUE)
+  ) %>%
+  print()
+
+cat("\nQuantiles of raw es<LOCAL_PATH>")
+quantile(AKDE_df$est, probs = c(0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1), na.rm = TRUE)
+
+cat("\nTop 30 largest AKDE windows by raw es<LOCAL_PATH>")
+AKDE_df %>%
+  arrange(desc(est)) %>%
+  select(seg_key, id, hr_season_year, hr_season, window_start, window_end, low, est, high) %>%
+  head(30) %>%
+  print(n = 30)
+
+```
+
+## Plot Distrubutions
+```{r}
+ggplot(AKDE_df, aes(x = est)) +
+  geom_histogram(bins = 60) +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(
+    title = "Distribution of AKDE estimated area",
+    subtitle = "Raw est values; log10 x-axis",
+    x = "AKDE area estimate, raw units",
+    y = "Number of windows"
+  )
+
+ggplot(AKDE_df, aes(x = hr_season, y = est)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "AKDE estimated area by season",
+    subtitle = "Raw est values; log10 y-axis",
+    x = "Season",
+    y = "AKDE area estimate, raw units"
+  )
+
+ggplot(AKDE_df, aes(x = reorder(seg_key, est, FUN = median), y = est)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  coord_flip() +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "AKDE estimated area by seg_key",
+    subtitle = "Raw est values; log10 y-axis",
+    x = "seg_key",
+    y = "AKDE area estimate, raw units"
+  )
+
+library(dplyr)
+library(ggplot2)
+
+# ============================================================
+# Count how many AKDE rows would be removed if est > 100
+# ============================================================
+
+threshold <- 100
+
+akde_removal_summary <- AKDE_df %>%
+  summarize(
+    total_rows = n(),
+    rows_above_100 = sum(est > threshold, na.rm = TRUE),
+    rows_at_or_below_100 = sum(est <= threshold, na.rm = TRUE),
+    rows_missing_est = sum(is.na(est)),
+    pct_removed = 100 * rows_above_100 / total_rows
+  )
+
+print(akde_removal_summary)
+
+AKDE_above_100 <- AKDE_df %>%
+  filter(est > 100) %>%
+  arrange(desc(est))
+
+print(AKDE_above_100)
+
+threshold <- 100
+
+AKDE_df_under_100 <- AKDE_df %>%
+  filter(
+    !is.na(est),
+    !is.na(high),
+    est <= threshold,
+    high <= threshold
+  )
+
+
+# =============================================================================
+# Save filtered AKDE dataframe checkpoint
+# =============================================================================
+
+library(readr)
+library(dplyr)
+
+# Use the under-100 filtered AKDE dataframe as the main AKDE_df
+AKDE_df <- AKDE_df_under_100
+
+# Quick sanity checks
+cat("\nRows in AKDE_df_under_100:", nrow(AKDE_df_under_100), "\n")
+cat("Rows now in AKDE_df:", nrow(AKDE_df), "\n")
+
+cat("\nColumn<LOCAL_PATH>")
+print(colnames(AKDE_df))
+
+cat("\nAKDE estimate summar<LOCAL_PATH>")
+AKDE_df %>%
+  summarise(
+    n_rows = n(),
+    n_missing_est = sum(is.na(est)),
+    min_est = min(est, na.rm = TRUE),
+    median_est = median(est, na.rm = TRUE),
+    mean_est = mean(est, na.rm = TRUE),
+    max_est = max(est, na.rm = TRUE)
+  ) %>%
+  print()
+
+# Save main checkpoint
+readr::write_csv(
+  AKDE_df,
+  "<LOCAL_PATH>"
+)
+
+cat("\n✅ Saved AKDE_df checkpoint.\n")
+cat("<LOCAL_PATH>")
+
+```
+
+## Update everything below:
+
+
+```{r}
+# =============================================================================
+# RELOAD SAVED SLIDING-WINDOW AKDE OUTPUTS
+# Use this when AKDE already ran and you do NOT want to rerun it
+# =============================================================================
+
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tibble)
+library(stringr)
+
+# -----------------------------------------------------------------------------
+# Params must match the AKDE run
+# -----------------------------------------------------------------------------
+
+win_days    <- 7
+step_days   <- 1
+tz_analysis <- "UTC"
+
+# -----------------------------------------------------------------------------
+# Required paths
+# -----------------------------------------------------------------------------
+
+
+akde_input_path <- file.path(
+  ARTICLE_OUT_DIR,
+  "akde_article_seasonal_input.csv"
+)
+
+akde_area_path <- file.path(
+  ARTICLE_OUT_DIR,
+  "sliding_window_akde_area_by_article_season.csv"
+)
+
+# -----------------------------------------------------------------------------
+# Safety checks
+# -----------------------------------------------------------------------------
+
+if (!file.exists(akde_area_path)) {
+  stop(
+    "Could not find saved AKDE area fil<LOCAL_PATH>",
+    akde_area_path,
+    "\n\nYou may need to check ARTICLE_OUT_DIR or confirm the AKDE chunk finished saving."
+  )
+}
+
+if (!file.exists(akde_input_path)) {
+  warning(
+    "Could not find saved AKDE input fil<LOCAL_PATH>",
+    akde_input_path,
+    "\n\nContinuing with the AKDE area file only."
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Reload saved AKDE area output
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- readr::read_csv(
+  akde_area_path,
+  show_col_types = FALSE
+)
+
+# -----------------------------------------------------------------------------
+# Normalize date/time columns
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    window_start = as.POSIXct(window_start, tz = tz_analysis),
+    window_end = if ("window_end" %in% names(.)) {
+      as.POSIXct(window_end, tz = tz_analysis)
+    } else {
+      window_start + lubridate::days(win_days)
+    }
+  )
+
+# -----------------------------------------------------------------------------
+# Rebuild km2 columns if needed
+#
+# Your AKDE code treated low/est/high as already km²:
+#   low_km2  = low
+#   est_km2  = est
+#   high_km2 = high
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    low_km2  = if ("low_km2"  %in% names(.)) low_km2  else low,
+    est_km2  = if ("est_km2"  %in% names(.)) est_km2  else est,
+    high_km2 = if ("high_km2" %in% names(.)) high_km2 else high
+  )
+
+# -----------------------------------------------------------------------------
+# Reload AKDE input and metadata if available
+# This is useful if metadata columns were missing or got changed during save/load
+# -----------------------------------------------------------------------------
+
+if (file.exists(akde_input_path)) {
+
+  akde_df <- readr::read_csv(
+    akde_input_path,
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      id = as.character(id),
+      hr_season = as.character(hr_season),
+      hr_season_year = as.integer(hr_season_year),
+      date = as.POSIXct(date, tz = tz_analysis),
+      seg_key = as.character(seg_key)
+    )
+
+  seg_metadata <- akde_df %>%
+    distinct(
+      seg_key,
+      id,
+      hr_season_year,
+      hr_season,
+      Sex,
+      `CWD Status`
+    )
+
+  # Only join metadata columns if they are missing or incomplete
+  segwin_area_df <- segwin_area_df %>%
+    mutate(seg_key = as.character(seg_key)) %>%
+    select(
+      -any_of(c("id", "hr_season_year", "hr_season", "Sex", "CWD Status"))
+    ) %>%
+    left_join(seg_metadata, by = "seg_key")
+
+} else {
+
+  akde_df <- NULL
+
+  seg_metadata <- segwin_area_df %>%
+    distinct(
+      seg_key,
+      id,
+      hr_season_year,
+      hr_season,
+      Sex,
+      `CWD Status`
+    )
+}
+
+# -----------------------------------------------------------------------------
+# Final ordering
+# -----------------------------------------------------------------------------
+
+segwin_area_df <- segwin_area_df %>%
+  arrange(id, hr_season_year, hr_season, window_start)
+
+# -----------------------------------------------------------------------------
+# QA: confirm reload worked
+# -----------------------------------------------------------------------------
+
+cat("\n✅ Reloaded saved sliding-window AKDE area output.\n")
+cat("File loaded fro<LOCAL_PATH>")
+cat(akde_area_path, "\n\n")
+
+cat("Rows loaded:", nrow(segwin_area_df), "\n")
+cat("Unique article seasonal seg_keys:", dplyr::n_distinct(segwin_area_df$seg_key), "\n\n")
+
+cat("Previe<LOCAL_PATH>")
+segwin_area_df %>%
+  select(
+    seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    window_start,
+    window_end,
+    low,
+    est,
+    high,
+    low_km2,
+    est_km2,
+    high_km2
+  ) %>%
+  head(20) %>%
+  print()
+
+cat("\nWindows per article seasonal seg_ke<LOCAL_PATH>")
+segwin_area_df %>%
+  group_by(seg_key, id, hr_season_year, hr_season) %>%
+  summarise(
+    n_windows = n(),
+    mean_est_km2 = mean(est_km2, na.rm = TRUE),
+    median_est_km2 = median(est_km2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_windows)) %>%
+  print(n = Inf)
+
+```
+
+```{r}
+library(slider)
+# Reconstruct window_end from segwin_area_df
+segwin_area_df <- segwin_area_df %>%
+  arrange(seg_key, window_start) %>%
+  mutate(window_end = window_start + days(win_days))
+
+# 1) Check window length = 7 days
+chk_len <- segwin_area_df %>%
+  transmute(seg_key,
+            len_days = as.numeric(difftime(window_end, window_start, units="days"))) %>%
+  group_by(seg_key) %>%
+  summarise(min_len = min(len_days), max_len = max(len_days), .groups="drop")
+print(chk_len %>% slice_head(n = 10))
+# Expect min_len == max_len == 7 for all seg_keys
+
+# 2) Check step between consecutive windows = 1 day
+chk_step <- segwin_area_df %>%
+  group_by(seg_key) %>%
+  arrange(window_start) %>%
+  mutate(step_days = as.numeric(difftime(lead(window_start), window_start, units="days"))) %>%
+  summarise(min_step = min(step_days, na.rm=TRUE),
+            max_step = max(step_days, na.rm=TRUE), .groups="drop")
+print(chk_step %>% slice_head(n = 10))
+# Expect min_step == max_step == 1 (or NA for single-window segments)
+
+segwin_area_df <- segwin_area_df %>%
+  arrange(seg_key, window_start) %>%
+  group_by(seg_key) %>%
+  mutate(
+    # mean over windows whose window_start is within the last 7 calendar days
+    akde_est_7d  = slide_index_dbl(est,  window_start,
+                                   ~ mean(.x, na.rm=TRUE),
+                                   .before = days(6), .complete = TRUE),
+    akde_low_7d  = slide_index_dbl(low,  window_start,
+                                   ~ mean(.x, na.rm=TRUE),
+                                   .before = days(6), .complete = TRUE),
+    akde_high_7d = slide_index_dbl(high, window_start,
+                                   ~ mean(.x, na.rm=TRUE),
+                                   .before = days(6), .complete = TRUE)
+  ) %>%
+  ungroup()
+
+# Pick an example segment
+ex_key <- segwin_area_df$seg_key[1]
+
+# 1) Confirm first non-NA MA appears only after 7 calendar days of windows
+segwin_area_df %>%
+  filter(seg_key == ex_key) %>%
+  transmute(window_start, est, akde_est_7d) %>%
+  head(15) %>%
+  print(n=Inf)
+
+# 2) Visual check (raw vs 7d MA)
+library(ggplot2)
+ggplot(segwin_area_df %>% filter(seg_key == ex_key),
+       aes(window_start, est)) +
+  geom_line(alpha = 0.4) +
+  geom_line(aes(y = akde_est_7d)) +
+  labs(title = paste("AKDE area (raw) & 7-day MA —", ex_key),
+       x = "Window start", y = "Area") +
+  theme_minimal()
+
+```
+
+```{r}
+# =============================================================================
+# Attach saved sliding-window AKDE values back onto point-level article data
+# WITHOUT rerunning AKDE
+# =============================================================================
+
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tidyr)
+
+# -----------------------------------------------------------------------------
+# Params
+# -----------------------------------------------------------------------------
+
+win_days    <- 7
+tz_analysis <- "UTC"
+
+# -----------------------------------------------------------------------------
+# Reload point-level AKDE input if needed
+# -----------------------------------------------------------------------------
+
+if (!exists("akde_df")) {
+
+  akde_input_path <- file.path(
+    ARTICLE_OUT_DIR,
+    "akde_article_seasonal_input.csv"
+  )
+
+  if (!file.exists(akde_input_path)) {
+    stop(
+      "akde_df is not in memory and the saved AKDE input file was not foun<LOCAL_PATH>",
+      akde_input_path
+    )
+  }
+
+  akde_df <- readr::read_csv(
+    akde_input_path,
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      id = as.character(id),
+      hr_season = as.character(hr_season),
+      hr_season_year = as.integer(hr_season_year),
+      seg_key = as.character(seg_key),
+      date = as.POSIXct(date, tz = tz_analysis)
+    )
+}
+
+# -----------------------------------------------------------------------------
+# Reload sliding-window AKDE area results if needed
+# -----------------------------------------------------------------------------
+
+if (!exists("segwin_area_df")) {
+
+  akde_area_path <- file.path(
+    ARTICLE_OUT_DIR,
+    "sliding_window_akde_area_by_article_season.csv"
+  )
+
+  if (!file.exists(akde_area_path)) {
+    stop(
+      "segwin_area_df is not in memory and the saved AKDE area file was not foun<LOCAL_PATH>",
+      akde_area_path
+    )
+  }
+
+  segwin_area_df <- readr::read_csv(
+    akde_area_path,
+    show_col_types = FALSE
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Normalize time columns
+# -----------------------------------------------------------------------------
+
+akde_df <- akde_df %>%
+  mutate(
+    seg_key = as.character(seg_key),
+    date = as.POSIXct(date, tz = tz_analysis)
+  )
+
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    seg_key = as.character(seg_key),
+    window_start = as.POSIXct(window_start, tz = tz_analysis),
+    window_end = if ("window_end" %in% names(.)) {
+      as.POSIXct(window_end, tz = tz_analysis)
+    } else {
+      window_start + lubridate::days(win_days)
+    },
+    low_km2 = if ("low_km2" %in% names(.)) low_km2 else low,
+    est_km2 = if ("est_km2" %in% names(.)) est_km2 else est,
+    high_km2 = if ("high_km2" %in% names(.)) high_km2 else high
+  )
+
+# -----------------------------------------------------------------------------
+# Make sure 7-day moving average columns exist
+# -----------------------------------------------------------------------------
+
+if (!all(c("akde_est_7d", "akde_low_7d", "akde_high_7d") %in% names(segwin_area_df))) {
+
+  library(slider)
+
+  segwin_area_df <- segwin_area_df %>%
+    arrange(seg_key, window_start) %>%
+    group_by(seg_key) %>%
+    mutate(
+      akde_est_7d = slide_index_dbl(
+        est_km2,
+        window_start,
+        ~ mean(.x, na.rm = TRUE),
+        .before = days(6),
+        .complete = TRUE
+      ),
+      akde_low_7d = slide_index_dbl(
+        low_km2,
+        window_start,
+        ~ mean(.x, na.rm = TRUE),
+        .before = days(6),
+        .complete = TRUE
+      ),
+      akde_high_7d = slide_index_dbl(
+        high_km2,
+        window_start,
+        ~ mean(.x, na.rm = TRUE),
+        .before = days(6),
+        .complete = TRUE
+      )
+    ) %>%
+    ungroup()
+}
+
+# -----------------------------------------------------------------------------
+# Attach each GPS point to the most recent AKDE window_start
+#
+# Logic:
+# Each AKDE window represents the 7-day area from:
+#   window_start through window_end
+#
+# For each GPS fix, attach the AKDE window where:
+#   date >= window_start and date <= window_end
+#
+# Since windows overlap, a GPS fix can fall into multiple windows.
+# To avoid duplicated rows, we keep the most recent window_start for each fix.
+# -----------------------------------------------------------------------------
+
+akde_points_with_area <- akde_df %>%
+  mutate(.rid = row_number()) %>%
+  select(-any_of(c(
+    "low", "est", "high",
+    "low_km2", "est_km2", "high_km2",
+    "akde_est_7d", "akde_low_7d", "akde_high_7d",
+    "akde_window_start", "akde_window_end"
+  ))) %>%
+  left_join(
+    segwin_area_df %>%
+      select(
+        seg_key,
+        window_start,
+        window_end,
+        low,
+        est,
+        high,
+        low_km2,
+        est_km2,
+        high_km2,
+        akde_est_7d,
+        akde_low_7d,
+        akde_high_7d
+      ),
+    by = "seg_key",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    is.na(window_start) |
+      (date >= window_start & date <= window_end)
+  ) %>%
+  group_by(.rid) %>%
+  arrange(desc(window_start), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  rename(
+    akde_window_start = window_start,
+    akde_window_end = window_end
+  ) %>%
+  arrange(seg_key, date)
+
+# -----------------------------------------------------------------------------
+# Diagnostics
+# -----------------------------------------------------------------------------
+
+cat("\nRows in original akde_df:", nrow(akde_df), "\n")
+cat("Rows after AKDE join:", nrow(akde_points_with_area), "\n")
+cat("Rows with AKDE est_km2:", sum(!is.na(akde_points_with_area$est_km2)), "\n")
+cat("Rows without AKDE est_km2:", sum(is.na(akde_points_with_area$est_km2)), "\n\n")
+
+cat("Previe<LOCAL_PATH>")
+akde_points_with_area %>%
+  select(
+    seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    date,
+    akde_window_start,
+    akde_window_end,
+    est_km2,
+    akde_est_7d
+  ) %>%
+  head(20) %>%
+  print()
+
+# -----------------------------------------------------------------------------
+# Save point-level file with attached sliding-window AKDE values
+# -----------------------------------------------------------------------------
+
+readr::write_csv(
+  akde_points_with_area,
+  file.path(ARTICLE_OUT_DIR, "article_points_with_sliding_window_akde.csv")
+)
+
+readr::write_csv(
+  akde_points_with_area,
+  "<LOCAL_PATH>"
+)
+
+readr::write_csv(
+  akde_points_with_area,
+  "<LOCAL_PATH>"
+)
+
+cat("\n✅ Saved point-level dataset with sliding-window AKDE attached.\n")
+cat("Saved t<LOCAL_PATH>")
+cat(file.path(ARTICLE_OUT_DIR, "article_points_with_sliding_window_akde.csv"), "\n")
+cat("<LOCAL_PATH>")
+cat("<LOCAL_PATH>")
+```
+
+```{r}
+# =============================================================================
+# Inspect / clean AKDE columns from article point-level data
+# =============================================================================
+
+library(dplyr)
+library(readr)
+library(lubridate)
+library(data.table)
+
+# -----------------------------------------------------------------------------
+# Confirm objects exist
+# -----------------------------------------------------------------------------
+
+if (!exists("akde_df")) {
+  akde_input_path <- file.path(ARTICLE_OUT_DIR, "akde_article_seasonal_input.csv")
+
+  if (!file.exists(akde_input_path)) {
+    stop("akde_df not found in memory and saved input file not foun<LOCAL_PATH>", akde_input_path)
+  }
+
+  akde_df <- readr::read_csv(
+    akde_input_path,
+    show_col_types = FALSE
+  )
+}
+
+if (!exists("segwin_area_df")) {
+  akde_area_path <- file.path(ARTICLE_OUT_DIR, "sliding_window_akde_area_by_article_season.csv")
+
+  if (!file.exists(akde_area_path)) {
+    stop("segwin_area_df not found in memory and saved AKDE file not foun<LOCAL_PATH>", akde_area_path)
+  }
+
+  segwin_area_df <- readr::read_csv(
+    akde_area_path,
+    show_col_types = FALSE
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Normalize core columns
+# -----------------------------------------------------------------------------
+
+akde_df <- akde_df %>%
+  mutate(
+    id = as.character(id),
+    seg_key = as.character(seg_key),
+    hr_season = as.character(hr_season),
+    hr_season_year = as.integer(hr_season_year),
+    date = as.POSIXct(date, tz = "UTC")
+  )
+
+segwin_area_df <- segwin_area_df %>%
+  mutate(
+    seg_key = as.character(seg_key),
+    window_start = as.POSIXct(window_start, tz = "UTC"),
+    window_end = if ("window_end" %in% names(.)) {
+      as.POSIXct(window_end, tz = "UTC")
+    } else {
+      window_start + lubridate::days(win_days)
+    },
+    low_km2 = if ("low_km2" %in% names(.)) low_km2 else low,
+    est_km2 = if ("est_km2" %in% names(.)) est_km2 else est,
+    high_km2 = if ("high_km2" %in% names(.)) high_km2 else high
+  )
+
+# -----------------------------------------------------------------------------
+# Inspect columns
+# -----------------------------------------------------------------------------
+
+colnames(akde_df)
+colnames(segwin_area_df)
+
+# Identify any old AKDE-related columns on the point-level data
+akde_cols <- grep(
+  "^akde_|area_poly_km2|^low$|^est$|^high$|^low_km2$|^est_km2$|^high_km2$",
+  names(akde_df),
+  value = TRUE
+)
+
+akde_cols
+
+# Drop old AKDE columns from point-level data before rejoining cleanly
+akde_df <- akde_df %>%
+  select(-any_of(akde_cols))
+
+# Sanity check
+grep(
+  "^akde_|area_poly_km2|^low$|^est$|^high$|^low_km2$|^est_km2$|^high_km2$",
+  names(akde_df),
+  value = TRUE
+)
+
+# Save the AKDE window-level output
+readr::write_csv(
+  segwin_area_df,
+  "<LOCAL_PATH>"
+)
+```
+
+
+```{r}
+# =============================================================================
+# Join sliding-window AKDE results back to article point-level data
+# =============================================================================
+
+library(data.table)
+library(dplyr)
+library(readr)
+library(lubridate)
+
+# -----------------------------------------------------------------------------
+# Make sure 7-day moving average columns exist
+# -----------------------------------------------------------------------------
+
+if (!all(c("akde_est_7d", "akde_low_7d", "akde_high_7d") %in% names(segwin_area_df))) {
+
+  library(slider)
+
+  segwin_area_df <- segwin_area_df %>%
+    arrange(seg_key, window_start) %>%
+    group_by(seg_key) %>%
+    mutate(
+      akde_est_7d = slide_index_dbl(
+        est_km2,
+        window_start,
+        ~ mean(.x, na.rm = TRUE),
+        .before = days(6),
+        .complete = TRUE
+      ),
+      akde_low_7d = slide_index_dbl(
+        low_km2,
+        window_start,
+        ~ mean(.x, na.rm = TRUE),
+        .before = days(6),
+        .complete = TRUE
+      ),
+      akde_high_7d = slide_index_dbl(
+        high_km2,
+        window_start,
+        ~ mean(.x, na.rm = TRUE),
+        .before = days(6),
+        .complete = TRUE
+      )
+    ) %>%
+    ungroup()
+}
+
+# -----------------------------------------------------------------------------
+# Prepare data.table objects
+# -----------------------------------------------------------------------------
+
+akde_df_dt <- as.data.table(akde_df)
+
+akde_df_dt[, date := as.POSIXct(date, tz = "UTC")]
+akde_df_dt[, .rid := .I]
+
+win_dt <- as.data.table(segwin_area_df)
+
+win_dt[, `:=`(
+  window_start = as.POSIXct(window_start, tz = "UTC"),
+  window_end   = as.POSIXct(window_end,   tz = "UTC")
+)]
+
+# -----------------------------------------------------------------------------
+# Keep only columns needed for interval overlap
+# -----------------------------------------------------------------------------
+
+pts <- akde_df_dt[, .(
+  seg_key,
+  date_start = date,
+  date_end = date,
+  .rid
+)]
+
+wins <- win_dt[, .(
+  seg_key,
+  window_start,
+  window_end,
+  low,
+  est,
+  high,
+  low_km2,
+  est_km2,
+  high_km2,
+  akde_est_7d,
+  akde_low_7d,
+  akde_high_7d
+)]
+
+# -----------------------------------------------------------------------------
+# Interval join:
+# point date must fall within AKDE window_start/window_end
+# -----------------------------------------------------------------------------
+
+setkey(wins, seg_key, window_start, window_end)
+setkey(pts,  seg_key, date_start,   date_end)
+
+ov <- foverlaps(
+  pts,
+  wins,
+  by.x = c("seg_key", "date_start", "date_end"),
+  by.y = c("seg_key", "window_start", "window_end"),
+  type = "within",
+  nomatch = NA
+)
+
+# -----------------------------------------------------------------------------
+# Because windows overlap, a GPS point can match multiple windows.
+#
+# Keep the most recent window_start for each point.
+# This means each point receives the most up-to-date AKDE window that contains it.
+# -----------------------------------------------------------------------------
+
+if (anyDuplicated(ov$.rid)) {
+  setorder(ov, .rid, -window_start)
+  ov <- ov[!duplicated(.rid)]
+}
+
+# -----------------------------------------------------------------------------
+# Merge AKDE stats back onto full point-level table
+# -----------------------------------------------------------------------------
+
+akde_points_with_area <- merge(
+  akde_df_dt,
+  ov[, .(
+    .rid,
+    akde_window_start = window_start,
+    akde_window_end = window_end,
+    low,
+    est,
+    high,
+    low_km2,
+    est_km2,
+    high_km2,
+    akde_est_7d,
+    akde_low_7d,
+    akde_high_7d
+  )],
+  by = ".rid",
+  all.x = TRUE
+)[, .rid := NULL][]
+
+akde_points_with_area <- as_tibble(akde_points_with_area) %>%
+  arrange(seg_key, date)
+
+# -----------------------------------------------------------------------------
+# Sanity checks
+# -----------------------------------------------------------------------------
+
+cat("\nRows in akde_df:", nrow(akde_df), "\n")
+cat("Rows after AKDE join:", nrow(akde_points_with_area), "\n")
+cat("Rows with est_km2:", sum(!is.na(akde_points_with_area$est_km2)), "\n")
+cat("Rows missing est_km2:", sum(is.na(akde_points_with_area$est_km2)), "\n\n")
+
+akde_points_with_area %>%
+  select(
+    seg_key,
+    id,
+    hr_season_year,
+    hr_season,
+    date,
+    akde_window_start,
+    akde_window_end,
+    est_km2,
+    akde_est_7d
+  ) %>%
+  head(20) %>%
+  print()
+
+# Optional save after AKDE join
+readr::write_csv(
+  akde_points_with_area,
+  file.path(ARTICLE_OUT_DIR, "article_points_with_sliding_window_akde.csv")
+)
+
+
+head(akde_points_with_area)
+```
+
+```{r}
+# =============================================================================
+# Add movement features to point-level article-season AKDE dataset
+# =============================================================================
+
+library(dplyr)
+library(slider)
+library(moments)
+library(readr)
+
+# -----------------------------------------------------------------------------
+# Helper: windowed sinuosity on x/y coords
+# -----------------------------------------------------------------------------
+
+calc_windowed_sinuosity <- function(easting, northing) {
+
+  if (length(easting) < 2 || length(northing) < 2) {
+    return(NA_real_)
+  }
+
+  net_disp <- sqrt(
+    (easting[length(easting)] - easting[1])^2 +
+      (northing[length(northing)] - northing[1])^2
+  )
+
+  total_dist <- sum(
+    sqrt(diff(easting)^2 + diff(northing)^2),
+    na.rm = TRUE
+  )
+
+  if (!is.finite(total_dist) || total_dist == 0) {
+    return(NA_real_)
+  }
+
+  net_disp / total_dist
+}
+
+# -----------------------------------------------------------------------------
+# Add features
+# -----------------------------------------------------------------------------
+
+deer_AKDE_Final <- akde_points_with_area %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(
+    abs_rel_angle = abs(rel.angle),
+
+    # dt from adehabitatLT is in seconds; dist is in meters if x/y are UTM
+    velo = ifelse(
+      is.finite(dt) & dt > 0,
+      dist / dt,
+      NA_real_
+    )
+  ) %>%
+  mutate(
+    # Sinuosity over current point + previous 27 fixes
+    sinuosity_28pt = slide_dbl(
+      .x = seq_along(date),
+      .f = function(i) {
+        i0 <- max(1L, i - 27L)
+        i1 <- i
+        calc_windowed_sinuosity(x[i0:i1], y[i0:i1])
+      },
+      .before = 0,
+      .after = 0,
+      .complete = FALSE
+    ),
+
+    # Rolling abs rel angle stats
+    rolling_abs_rel_angle_mean = slide_dbl(
+      abs_rel_angle,
+      ~ mean(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_abs_rel_angle_var = slide_dbl(
+      abs_rel_angle,
+      ~ var(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_abs_rel_angle_sd = slide_dbl(
+      abs_rel_angle,
+      ~ sd(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_abs_rel_angle_skew = slide_dbl(
+      abs_rel_angle,
+      ~ moments::skewness(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_abs_rel_angle_kurt = slide_dbl(
+      abs_rel_angle,
+      ~ moments::kurtosis(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+
+    # Rolling velocity stats
+    rolling_velo_mean = slide_dbl(
+      velo,
+      ~ mean(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_velo_var = slide_dbl(
+      velo,
+      ~ var(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_velo_sd = slide_dbl(
+      velo,
+      ~ sd(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_velo_skew = slide_dbl(
+      velo,
+      ~ moments::skewness(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    ),
+    rolling_velo_kurt = slide_dbl(
+      velo,
+      ~ moments::kurtosis(.x, na.rm = TRUE),
+      .before = 27,
+      .after = 0,
+      .complete = FALSE
+    )
+  ) %>%
+  ungroup()
+
+# -----------------------------------------------------------------------------
+# Join status metadata only if status_final2 exists
+# Otherwise keep Sex / CWD Status already present from akde_df
+# -----------------------------------------------------------------------------
+
+if (exists("status_final2")) {
+
+  cat("\nstatus_final2 found. Joining status metadata from status_final2.\n")
+
+  status_final2_clean <- status_final2 %>%
+    mutate(AID = as.character(AID)) %>%
+    distinct(AID, .keep_all = TRUE)
+
+  deer_AKDE_Final <- deer_AKDE_Final %>%
+    select(-any_of(c("Sex", "CWD Status", "year_final"))) %>%
+    mutate(id = as.character(id)) %>%
+    left_join(
+      status_final2_clean %>%
+        select(AID, Sex, `CWD Status`, year_final),
+      by = c("id" = "AID")
+    )
+
+} else {
+
+  cat("\nstatus_final2 not found. Keeping Sex / CWD Status already present in deer_AKDE_Final.\n")
+
+  # Add year_final as NA if it does not exist, so later code does not break
+  if (!"year_final" %in% names(deer_AKDE_Final)) {
+    deer_AKDE_Final <- deer_AKDE_Final %>%
+      mutate(year_final = NA_integer_)
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Final diagnostics
+# -----------------------------------------------------------------------------
+
+cat("\nFinal column<LOCAL_PATH>")
+print(colnames(deer_AKDE_Final))
+
+cat("\nAKDE coverag<LOCAL_PATH>")
+cat("Rows:", nrow(deer_AKDE_Final), "\n")
+cat("Rows with est_km2:", sum(!is.na(deer_AKDE_Final$est_km2)), "\n")
+cat("Rows missing est_km2:", sum(is.na(deer_AKDE_Final$est_km2)), "\n")
+
+cat("\nCWD status summar<LOCAL_PATH>")
+if ("CWD Status" %in% names(deer_AKDE_Final)) {
+  deer_AKDE_Final %>%
+    count(`CWD Status`, sort = TRUE) %>%
+    print()
+} else {
+  cat("No `CWD Status` column found.\n")
+}
+
+cat("\nSex summar<LOCAL_PATH>")
+if ("Sex" %in% names(deer_AKDE_Final)) {
+  deer_AKDE_Final %>%
+    count(Sex, sort = TRUE) %>%
+    print()
+} else {
+  cat("No `Sex` column found.\n")
+}
+
+# -----------------------------------------------------------------------------
+# Save final output
+# -----------------------------------------------------------------------------
+
+readr::write_csv(
+  deer_AKDE_Final,
+  "<LOCAL_PATH>"
+)
+
+readr::write_csv(
+  deer_AKDE_Final,
+  "<LOCAL_PATH>"
+)
+
+readr::write_csv(
+  deer_AKDE_Final,
+  file.path(ARTICLE_OUT_DIR, "deer_AKDE_Final_article_seasonal.csv")
+)
+
+cat("\n✅ Saved final deer AKDE file.\n")
+cat("<LOCAL_PATH>")
+cat("<LOCAL_PATH>")
+cat(file.path(ARTICLE_OUT_DIR, "deer_AKDE_Final_article_seasonal.csv"), "\n")
+
+head(deer_AKDE_Final)
+```
+
+```{r}
+# =============================================================================
+# Create train/test datasets from final AKDE + movement dataset
+#
+# Logic:
+#   - Start from deer_AKDE_Final
+#   - Remove rows where AKDE est/high are > 100
+#   - Preserve all columns, including seasons, AKDE columns, and movement features
+#   - Any ID that is ever CWD-positive goes to TEST
+#   - IDs that are never CWD-positive go to TRAIN
+# =============================================================================
+
+library(dplyr)
+library(stringr)
+library(readr)
+
+# -----------------------------------------------------------------------------
+# Settings
+# -----------------------------------------------------------------------------
+
+threshold <- 100
+
+out_dir <- "<LOCAL_PATH>"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------------------------------------------------------
+# Start from final joined dataset
+# -----------------------------------------------------------------------------
+
+if (!exists("deer_AKDE_Final")) {
+  stop("deer_AKDE_Final does not exist. Load or create it before running this chunk.")
+}
+
+df <- deer_AKDE_Final
+
+# -----------------------------------------------------------------------------
+# Basic checks
+# -----------------------------------------------------------------------------
+
+if (!"id" %in% names(df)) {
+  stop("No `id` column found in deer_AKDE_Final.")
+}
+
+if (!"est" %in% names(df)) {
+  stop("No `est` column found in deer_AKDE_Final.")
+}
+
+if (!"high" %in% names(df)) {
+  stop("No `high` column found in deer_AKDE_Final.")
+}
+
+cat("\nRows before AKDE filtering:", nrow(df), "\n")
+cat("Unique IDs before AKDE filtering:", n_distinct(df$id, na.rm = TRUE), "\n")
+
+# -----------------------------------------------------------------------------
+# AKDE removal summary
+# -----------------------------------------------------------------------------
+
+akde_removal_summary <- df %>%
+  summarize(
+    total_rows = n(),
+    rows_above_100_est = sum(est > threshold, na.rm = TRUE),
+    rows_above_100_high = sum(high > threshold, na.rm = TRUE),
+    rows_est_or_high_above_100 = sum(est > threshold | high > threshold, na.rm = TRUE),
+    rows_at_or_below_100 = sum(est <= threshold & high <= threshold, na.rm = TRUE),
+    rows_missing_est = sum(is.na(est)),
+    rows_missing_high = sum(is.na(high)),
+    pct_removed = 100 * rows_est_or_high_above_100 / total_rows
+  )
+
+cat("\nAKDE removal summar<LOCAL_PATH>")
+print(akde_removal_summary)
+
+# -----------------------------------------------------------------------------
+# Save rows above threshold for inspection
+# -----------------------------------------------------------------------------
+
+AKDE_above_100 <- df %>%
+  filter(
+    is.na(est) |
+      is.na(high) |
+      est > threshold |
+      high > threshold
+  ) %>%
+  arrange(desc(est))
+
+cat("\nRows removed or missing AKDE value<LOCAL_PATH>")
+print(AKDE_above_100)
+
+readr::write_csv(
+  AKDE_above_100,
+  file.path(out_dir, "AKDE_removed_above_100_or_missing.csv")
+)
+
+# -----------------------------------------------------------------------------
+# Apply AKDE filter
+# -----------------------------------------------------------------------------
+
+AKDE_df_under_100 <- df %>%
+  filter(
+    !is.na(est),
+    !is.na(high),
+    est <= threshold,
+    high <= threshold
+  )
+
+# Use filtered AKDE dataset as the active dataset moving forward
+AKDE_df <- AKDE_df_under_100
+
+cat("\nRows after AKDE filtering:", nrow(AKDE_df), "\n")
+cat("Unique IDs after AKDE filtering:", n_distinct(AKDE_df$id, na.rm = TRUE), "\n")
+
+# Save filtered checkpoint
+readr::write_csv(
+  AKDE_df,
+  file.path(out_dir, "deer_AKDE_Final_under_100.csv")
+)
+
+readr::write_csv(
+  AKDE_df,
+  "<LOCAL_PATH>"
+)
+
+cat("\n✅ Saved filtered AKDE checkpoints.\n")
+cat(file.path(out_dir, "deer_AKDE_Final_under_100.csv"), "\n")
+cat("<LOCAL_PATH>")
+
+# -----------------------------------------------------------------------------
+# Continue train/test split from filtered AKDE dataframe
+# -----------------------------------------------------------------------------
+
+df <- AKDE_df
+
+# -----------------------------------------------------------------------------
+# If CWD Status is missing but status_final2 exists, join status metadata
+# -----------------------------------------------------------------------------
+
+if (!"CWD Status" %in% names(df) && exists("status_final2")) {
+
+  cat("\n`CWD Status` not found. Joining from status_final2.\n")
+
+  status_final2_clean <- status_final2 %>%
+    mutate(AID = as.character(AID)) %>%
+    distinct(AID, .keep_all = TRUE)
+
+  df <- df %>%
+    mutate(id = as.character(id)) %>%
+    left_join(
+      status_final2_clean %>%
+        select(AID, Sex, `CWD Status`, year_final),
+      by = c("id" = "AID")
+    )
+
+} else if ("CWD Status" %in% names(df)) {
+
+  cat("\n`CWD Status` found. Using existing status column.\n")
+
+} else {
+
+  stop("No `CWD Status` column found, and status_final2 does not exist.")
+}
+
+# -----------------------------------------------------------------------------
+# Label checks
+# -----------------------------------------------------------------------------
+
+cat("\nRows before labeling:", nrow(df), "\n")
+cat("Unique IDs before labeling:", n_distinct(df$id, na.rm = TRUE), "\n")
+cat("Rows missing ID:", sum(is.na(df$id)), "\n")
+
+# -----------------------------------------------------------------------------
+# Normalize CWD status values
+# -----------------------------------------------------------------------------
+
+df_labeled <- df %>%
+  mutate(
+    id = as.character(id),
+    CWD_status_std = str_to_lower(str_trim(as.character(`CWD Status`))),
+    CWD_status_std = case_when(
+      CWD_status_std %in% c(
+        "positive", "pos", "+", "cwd+", "cwd positive", "cwd-positive"
+      ) ~ "positive",
+
+      CWD_status_std %in% c(
+        "negative", "neg", "-", "cwd-", "cwd negative", "cwd-negative"
+      ) ~ "negative",
+
+      TRUE ~ CWD_status_std
+    )
+  )
+
+# -----------------------------------------------------------------------------
+# Keep only clearly labeled positive/negative rows
+# -----------------------------------------------------------------------------
+
+df_labeled <- df_labeled %>%
+  filter(CWD_status_std %in% c("positive", "negative"))
+
+cat("\nRows after keeping labeled positive/negative rows:", nrow(df_labeled), "\n")
+cat("Unique IDs after labeling:", n_distinct(df_labeled$id, na.rm = TRUE), "\n")
+
+cat("\nCWD status summary after standardizatio<LOCAL_PATH>")
+df_labeled %>%
+  count(CWD_status_std, sort = TRUE) %>%
+  print()
+
+# -----------------------------------------------------------------------------
+# Split by ID:
+# Any deer that is ever positive goes to TEST.
+# Never-positive deer go to TRAIN.
+# -----------------------------------------------------------------------------
+
+pos_ids <- df_labeled %>%
+  filter(CWD_status_std == "positive") %>%
+  distinct(id) %>%
+  pull(id)
+
+test_df <- df_labeled %>%
+  filter(id %in% pos_ids)
+
+train_df <- df_labeled %>%
+  filter(!id %in% pos_ids)
+
+# -----------------------------------------------------------------------------
+# Sanity checks
+# -----------------------------------------------------------------------------
+
+cat("\nTRAIN — rows:", nrow(train_df),
+    " | unique IDs:", n_distinct(train_df$id), "\n")
+
+cat("TEST  — rows:", nrow(test_df),
+    " | unique IDs:", n_distinct(test_df$id), "\n")
+
+cat("\nTRAIN status summar<LOCAL_PATH>")
+train_df %>%
+  count(CWD_status_std, sort = TRUE) %>%
+  print()
+
+cat("\nTEST status summar<LOCAL_PATH>")
+test_df %>%
+  count(CWD_status_std, sort = TRUE) %>%
+  print()
+
+ids_in_both <- intersect(unique(train_df$id), unique(test_df$id))
+
+cat("\nIDs in both train and test:", length(ids_in_both), "\n")
+
+stopifnot(length(ids_in_both) == 0)
+
+# -----------------------------------------------------------------------------
+# Check that AKDE columns survived
+# -----------------------------------------------------------------------------
+
+required_akde_cols <- c("low", "est", "high")
+
+optional_akde_cols <- c(
+  "low_km2",
+  "est_km2",
+  "high_km2",
+  "akde_est_7d",
+  "akde_low_7d",
+  "akde_high_7d"
+)
+
+missing_required_akde_cols <- setdiff(required_akde_cols, names(df_labeled))
+
+if (length(missing_required_akde_cols) > 0) {
+  stop(
+    "The following required AKDE columns are missing from df_labeled: ",
+    paste(missing_required_akde_cols, collapse = ", ")
+  )
+}
+
+cat("\n✅ Required AKDE columns preserve<LOCAL_PATH>")
+print(required_akde_cols)
+
+cat("\nOptional AKDE columns presen<LOCAL_PATH>")
+print(intersect(optional_akde_cols, names(df_labeled)))
+
+# -----------------------------------------------------------------------------
+# Check that movement feature columns survived
+# -----------------------------------------------------------------------------
+
+movement_cols <- c(
+  "abs_rel_angle",
+  "velo",
+  "sinuosity_28pt",
+  "rolling_abs_rel_angle_mean",
+  "rolling_abs_rel_angle_sd",
+  "rolling_velo_mean",
+  "rolling_velo_sd"
+)
+
+present_movement_cols <- intersect(movement_cols, names(df_labeled))
+missing_movement_cols <- setdiff(movement_cols, names(df_labeled))
+
+cat("\nMovement columns presen<LOCAL_PATH>")
+print(present_movement_cols)
+
+if (length(missing_movement_cols) > 0) {
+  cat("\nMovement columns missin<LOCAL_PATH>")
+  print(missing_movement_cols)
+}
+
+# -----------------------------------------------------------------------------
+# Check that season columns survived
+# -----------------------------------------------------------------------------
+
+season_cols <- c(
+  "hr_season",
+  "hr_season_year",
+  "activity_season",
+  "activity_season_year",
+  "seg_key"
+)
+
+present_season_cols <- intersect(season_cols, names(df_labeled))
+missing_season_cols <- setdiff(season_cols, names(df_labeled))
+
+cat("\nSeason columns presen<LOCAL_PATH>")
+print(present_season_cols)
+
+if (length(missing_season_cols) > 0) {
+  cat("\nSeason columns missin<LOCAL_PATH>")
+  print(missing_season_cols)
+}
+
+# -----------------------------------------------------------------------------
+# Save train/test files
+# -----------------------------------------------------------------------------
+
+write_csv(
+  train_df,
+  file.path(out_dir, "deer_train_negative.csv")
+)
+
+write_csv(
+  test_df,
+  file.path(out_dir, "deer_test_positive.csv")
+)
+
+# Also save labeled full filtered dataframe
+write_csv(
+  df_labeled,
+  file.path(out_dir, "deer_AKDE_Final_under_100_labeled.csv")
+)
+
+cat("\n✅ Saved train/test file<LOCAL_PATH>")
+cat(file.path(out_dir, "deer_train_negative.csv"), "\n")
+cat(file.path(out_dir, "deer_test_positive.csv"), "\n")
+cat(file.path(out_dir, "deer_AKDE_Final_under_100_labeled.csv"), "\n")
+```

@@ -1,0 +1,2053 @@
+---
+title: "Combo_AKDE_Results"
+author: "Raymond Blaha"
+date: "2026-07-13"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Reload Migratory and Resident AKDE Inputs and Outputs
+# Add AKDE low, est, and high estimates to the input CSVs
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(stringr)
+library(readr)
+
+# ------------------------------------------------------------
+# 1) Paths
+# ------------------------------------------------------------
+
+input_base_path <- "<LOCAL_PATH>"
+
+# Original cleaned input datasets used for AKDE
+migratory_input_path <- file.path(
+  input_base_path,
+  "combined_migratory_ids_cleaned_no_unrealistic_points.csv"
+)
+
+resident_input_path <- file.path(
+  input_base_path,
+  "combined_resident_ids_cleaned_no_unrealistic_points.csv"
+)
+
+# Migratory AKDE output location
+migratory_akde_dir <- file.path(
+  input_base_path,
+  "akde_outputs"
+)
+
+migratory_area_path <- file.path(
+  migratory_akde_dir,
+  "migratory_AKDE_7day_windows.csv"
+)
+
+# Resident AKDE output location on the SanDisk drive
+resident_akde_dir <- "<LOCAL_PATH>"
+
+resident_area_path <- file.path(
+  resident_akde_dir,
+  "resident_AKDE_7day_windows.csv"
+)
+
+# New output files
+migratory_joined_out <- file.path(
+  migratory_akde_dir,
+  "migratory_input_with_AKDE_area.csv"
+)
+
+resident_joined_out <- file.path(
+  resident_akde_dir,
+  "resident_input_with_AKDE_area.csv"
+)
+
+# ------------------------------------------------------------
+# 2) Verify that all required files exist
+# ------------------------------------------------------------
+
+required_files <- c(
+  migratory_input_path,
+  resident_input_path,
+  migratory_area_path,
+  resident_area_path
+)
+
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    "The following required files were not foun<LOCAL_PATH>",
+    paste(missing_files, collapse = "\n")
+  )
+}
+
+cat("All required files were found.\n")
+
+# ------------------------------------------------------------
+# 3) Helper: parse timestamps consistently
+# ------------------------------------------------------------
+
+parse_datetime_safe <- function(x) {
+  parse_date_time(
+    as.character(x),
+    orders = c(
+      "Y-m-d H:M:S",
+      "Y-m-d H:M",
+      "Y-m-d",
+      "ymd HMS",
+      "ymd HM",
+      "ymd",
+      "mdy HMS",
+      "mdy HM",
+      "mdy"
+    ),
+    tz = "UTC",
+    quiet = TRUE
+  )
+}
+
+# ------------------------------------------------------------
+# 4) Helper: create one consistent date_time column
+# ------------------------------------------------------------
+
+standardize_datetime <- function(df) {
+  
+  if ("date_time" %in% names(df)) {
+    
+    df <- df %>%
+      mutate(date_time = parse_datetime_safe(date_time))
+    
+  } else if ("date" %in% names(df)) {
+    
+    df <- df %>%
+      mutate(date_time = parse_datetime_safe(date))
+    
+  } else {
+    
+    stop("Neither a date_time nor date column was found.")
+  }
+  
+  df
+}
+
+# ============================================================
+# MIGRATORY DATA
+# ============================================================
+
+# ------------------------------------------------------------
+# 5) Reload migratory input and AKDE area output
+# ------------------------------------------------------------
+
+migratory_input <- read_csv(
+  migratory_input_path,
+  show_col_types = FALSE
+) %>%
+  clean_names() %>%
+  standardize_datetime()
+
+migratory_area <- read_csv(
+  migratory_area_path,
+  show_col_types = FALSE
+) %>%
+  clean_names() %>%
+  mutate(
+    window_start = parse_datetime_safe(window_start)
+  )
+
+cat("\nMigratory input rows:", nrow(migratory_input), "\n")
+cat("Migratory AKDE rows:", nrow(migratory_area), "\n")
+
+# ------------------------------------------------------------
+# 6) Recreate id_phase exactly as in the AKDE pipeline
+# ------------------------------------------------------------
+
+if (!"phases" %in% names(migratory_input)) {
+  stop("The migratory input does not contain a phases column.")
+}
+
+migratory_input <- migratory_input %>%
+  mutate(
+    id = as.character(id),
+    
+    phases_clean = phases %>%
+      as.character() %>%
+      str_trim() %>%
+      str_squish() %>%
+      str_replace_all("_", " ") %>%
+      str_to_lower(),
+    
+    phase_num = str_extract(phases_clean, "\\d+"),
+    
+    phase_label = case_when(
+      !is.na(phase_num) ~ paste0("Phase_", phase_num),
+      TRUE ~ phases_clean %>%
+        str_to_title() %>%
+        str_replace_all("\\s+", "_")
+    ),
+    
+    id_phase = paste(id, phase_label, sep = "_")
+  )
+
+# ------------------------------------------------------------
+# 7) Prepare migratory AKDE output for joining
+# ------------------------------------------------------------
+
+migratory_area_join <- migratory_area %>%
+  mutate(
+    id_phase = as.character(id_phase)
+  ) %>%
+  select(
+    id_phase,
+    window_start,
+    akde_low = low,
+    akde_est = est,
+    akde_high = high
+  )
+
+# Check for duplicate join keys
+migratory_duplicate_windows <- migratory_area_join %>%
+  count(id_phase, window_start, name = "n") %>%
+  filter(n > 1)
+
+if (nrow(migratory_duplicate_windows) > 0) {
+  warning(
+    "Duplicate migratory ID_Phase/window_start combinations were found. ",
+    "They will be collapsed before joining."
+  )
+  
+  migratory_area_join <- migratory_area_join %>%
+    group_by(id_phase, window_start) %>%
+    summarise(
+      akde_low = first(akde_low),
+      akde_est = first(akde_est),
+      akde_high = first(akde_high),
+      .groups = "drop"
+    )
+}
+
+# ------------------------------------------------------------
+# 8) Join migratory AKDE area estimates to input data
+# ------------------------------------------------------------
+
+migratory_with_akde <- migratory_input %>%
+  left_join(
+    migratory_area_join,
+    by = c(
+      "id_phase",
+      "date_time" = "window_start"
+    )
+  ) %>%
+  arrange(id, phase_num, date_time)
+
+cat("\nMigratory rows after join:", nrow(migratory_with_akde), "\n")
+cat(
+  "Migratory rows with AKDE estimates:",
+  sum(!is.na(migratory_with_akde$akde_est)),
+  "\n"
+)
+cat(
+  "Migratory rows without AKDE estimates:",
+  sum(is.na(migratory_with_akde$akde_est)),
+  "\n"
+)
+
+# ------------------------------------------------------------
+# 9) Migratory join summary by ID and phase
+# ------------------------------------------------------------
+
+migratory_join_summary <- migratory_with_akde %>%
+  group_by(id, phase_label, id_phase) %>%
+  summarise(
+    n_input_rows = n(),
+    n_akde_windows = sum(!is.na(akde_est)),
+    first_date = min(date_time, na.rm = TRUE),
+    last_date = max(date_time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(id, phase_label)
+
+cat("\nMigratory AKDE join summar<LOCAL_PATH>")
+print(migratory_join_summary, n = Inf)
+
+# ============================================================
+# RESIDENT DATA
+# ============================================================
+
+# ------------------------------------------------------------
+# 10) Reload resident input and AKDE area output
+# ------------------------------------------------------------
+
+resident_input <- read_csv(
+  resident_input_path,
+  show_col_types = FALSE
+) %>%
+  clean_names() %>%
+  standardize_datetime() %>%
+  mutate(id = as.character(id))
+
+resident_area <- read_csv(
+  resident_area_path,
+  show_col_types = FALSE
+) %>%
+  clean_names() %>%
+  mutate(
+    id = as.character(id),
+    window_start = parse_datetime_safe(window_start)
+  )
+
+cat("\nResident input rows:", nrow(resident_input), "\n")
+cat("Resident AKDE rows:", nrow(resident_area), "\n")
+
+# ------------------------------------------------------------
+# 11) Prepare resident AKDE output for joining
+# ------------------------------------------------------------
+
+resident_area_join <- resident_area %>%
+  select(
+    id,
+    window_start,
+    akde_low = low,
+    akde_est = est,
+    akde_high = high
+  )
+
+# Check for duplicate join keys
+resident_duplicate_windows <- resident_area_join %>%
+  count(id, window_start, name = "n") %>%
+  filter(n > 1)
+
+if (nrow(resident_duplicate_windows) > 0) {
+  warning(
+    "Duplicate resident ID/window_start combinations were found. ",
+    "They will be collapsed before joining."
+  )
+  
+  resident_area_join <- resident_area_join %>%
+    group_by(id, window_start) %>%
+    summarise(
+      akde_low = first(akde_low),
+      akde_est = first(akde_est),
+      akde_high = first(akde_high),
+      .groups = "drop"
+    )
+}
+
+# ------------------------------------------------------------
+# 12) Join resident AKDE area estimates to input data
+# ------------------------------------------------------------
+
+resident_with_akde <- resident_input %>%
+  left_join(
+    resident_area_join,
+    by = c(
+      "id",
+      "date_time" = "window_start"
+    )
+  ) %>%
+  arrange(id, date_time)
+
+cat("\nResident rows after join:", nrow(resident_with_akde), "\n")
+cat(
+  "Resident rows with AKDE estimates:",
+  sum(!is.na(resident_with_akde$akde_est)),
+  "\n"
+)
+cat(
+  "Resident rows without AKDE estimates:",
+  sum(is.na(resident_with_akde$akde_est)),
+  "\n"
+)
+
+# ------------------------------------------------------------
+# 13) Resident join summary by ID
+# ------------------------------------------------------------
+
+resident_join_summary <- resident_with_akde %>%
+  group_by(id) %>%
+  summarise(
+    n_input_rows = n(),
+    n_akde_windows = sum(!is.na(akde_est)),
+    first_date = min(date_time, na.rm = TRUE),
+    last_date = max(date_time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(id)
+
+cat("\nResident AKDE join summar<LOCAL_PATH>")
+print(resident_join_summary, n = Inf)
+
+# ============================================================
+# SAVE AUGMENTED DATASETS
+# ============================================================
+
+# ------------------------------------------------------------
+# 14) Remove temporary phase-cleaning columns if desired
+# ------------------------------------------------------------
+
+migratory_export <- migratory_with_akde %>%
+  select(
+    -phases_clean,
+    -phase_num
+  )
+
+resident_export <- resident_with_akde
+
+# ------------------------------------------------------------
+# 15) Save augmented input datasets
+# ------------------------------------------------------------
+
+write_csv(
+  migratory_export,
+  migratory_joined_out
+)
+
+write_csv(
+  resident_export,
+  resident_joined_out
+)
+
+# Save join summaries too
+write_csv(
+  migratory_join_summary,
+  file.path(
+    migratory_akde_dir,
+    "migratory_AKDE_join_summary.csv"
+  )
+)
+
+write_csv(
+  resident_join_summary,
+  file.path(
+    resident_akde_dir,
+    "resident_AKDE_join_summary.csv"
+  )
+)
+
+cat("\n============================================================\n")
+cat("Finished joining AKDE estimates.\n")
+cat("============================================================\n")
+
+cat("\nMigratory augmented CSV saved t<LOCAL_PATH>")
+cat(migratory_joined_out, "\n")
+
+cat("\nResident augmented CSV saved t<LOCAL_PATH>")
+cat(resident_joined_out, "\n")
+```
+
+```{r}
+# ============================================================
+# Check AKDE estimates after joining
+# ============================================================
+
+ggplot(
+  migratory_with_akde,
+  aes(x = date_time, y = akde_est, group = id_phase)
+) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ id_phase, scales = "free") +
+  labs(
+    title = "Migratory 7-Day AKDE Area Over Time",
+    x = "Window Start",
+    y = "AKDE Area Estimate"
+  ) +
+  theme_minimal(base_size = 10)
+
+
+ggplot(
+  resident_with_akde,
+  aes(x = date_time, y = akde_est, group = id)
+) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ id, scales = "free") +
+  labs(
+    title = "Resident 7-Day AKDE Area Over Time",
+    x = "Window Start",
+    y = "AKDE Area Estimate"
+  ) +
+  theme_minimal(base_size = 10)
+
+```
+
+```{r}
+# ============================================================
+# Combine Migratory and Resident Datasets with AKDE Areas
+# ============================================================
+
+library(tidyverse)
+library(readr)
+library(janitor)
+library(lubridate)
+
+# ------------------------------------------------------------
+# 1) File paths
+# ------------------------------------------------------------
+
+
+# Resident AKDE output location
+resident_akde_dir <- "<LOCAL_PATH>"
+
+
+migratory_path <- file.path(
+  resident_akde_dir,
+  "migratory_input_with_AKDE_area.csv"
+)
+
+
+# Resident AKDE output location
+resident_akde_dir <- "<LOCAL_PATH>"
+
+resident_path <- file.path(
+  resident_akde_dir,
+  "resident_input_with_AKDE_area.csv"
+)
+
+# Final combined output
+combined_out_dir <- "<LOCAL_PATH>"
+
+combined_out_path <- file.path(
+  combined_out_dir,
+  "combined_migratory_resident_with_AKDE_area.csv"
+)
+
+dir.create(
+  combined_out_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# ------------------------------------------------------------
+# 2) Check that both input files exist
+# ------------------------------------------------------------
+
+if (!file.exists(migratory_path)) {
+  stop("Migratory AKDE dataset not foun<LOCAL_PATH>", migratory_path)
+}
+
+if (!file.exists(resident_path)) {
+  stop("Resident AKDE dataset not foun<LOCAL_PATH>", resident_path)
+}
+
+cat("Migratory file foun<LOCAL_PATH>", migratory_path, "\n\n")
+cat("Resident file foun<LOCAL_PATH>", resident_path, "\n\n")
+
+# ------------------------------------------------------------
+# 3) Reload datasets
+# ------------------------------------------------------------
+
+migratory_data_akde <- read_csv(
+  migratory_path,
+  show_col_types = FALSE
+) %>%
+  clean_names()
+
+resident_data_akde <- read_csv(
+  resident_path,
+  show_col_types = FALSE
+) %>%
+  clean_names()
+
+cat("Migratory rows:", nrow(migratory_data_akde), "\n")
+cat("Resident rows :", nrow(resident_data_akde), "\n")
+
+# ------------------------------------------------------------
+# 4) Standardize datetime columns
+# ------------------------------------------------------------
+
+parse_datetime_safe <- function(x) {
+  parse_date_time(
+    as.character(x),
+    orders = c(
+      "Y-m-d H:M:S",
+      "Y-m-d H:M",
+      "Y-m-d",
+      "ymd HMS",
+      "ymd HM",
+      "ymd",
+      "mdy HMS",
+      "mdy HM",
+      "mdy"
+    ),
+    tz = "UTC",
+    quiet = TRUE
+  )
+}
+
+standardize_datetime <- function(df) {
+  
+  if ("date_time" %in% names(df)) {
+    
+    df <- df %>%
+      mutate(date_time = parse_datetime_safe(date_time))
+    
+  } else if ("date" %in% names(df)) {
+    
+    df <- df %>%
+      mutate(date_time = parse_datetime_safe(date))
+    
+  } else {
+    
+    stop("No date or date_time column found.")
+  }
+  
+  df
+}
+
+migratory_data_akde <- migratory_data_akde %>%
+  standardize_datetime()
+
+resident_data_akde <- resident_data_akde %>%
+  standardize_datetime()
+
+# ------------------------------------------------------------
+# 5) Standardize dataset labels
+# ------------------------------------------------------------
+
+migratory_data_akde <- migratory_data_akde %>%
+  mutate(
+    id = as.character(id),
+    dataset = "Migratory"
+  )
+
+resident_data_akde <- resident_data_akde %>%
+  mutate(
+    id = as.character(id),
+    dataset = "Resident"
+  )
+
+# ------------------------------------------------------------
+# 6) Ensure AKDE columns exist in both datasets
+# ------------------------------------------------------------
+
+akde_cols <- c(
+  "akde_low",
+  "akde_est",
+  "akde_high"
+)
+
+missing_migratory_akde <- setdiff(
+  akde_cols,
+  names(migratory_data_akde)
+)
+
+missing_resident_akde <- setdiff(
+  akde_cols,
+  names(resident_data_akde)
+)
+
+if (length(missing_migratory_akde) > 0) {
+  stop(
+    "Migratory data is missing AKDE columns: ",
+    paste(missing_migratory_akde, collapse = ", ")
+  )
+}
+
+if (length(missing_resident_akde) > 0) {
+  stop(
+    "Resident data is missing AKDE columns: ",
+    paste(missing_resident_akde, collapse = ", ")
+  )
+}
+
+# ------------------------------------------------------------
+# 7) Check column differences before combining
+# ------------------------------------------------------------
+
+migratory_only_columns <- setdiff(
+  names(migratory_data_akde),
+  names(resident_data_akde)
+)
+
+resident_only_columns <- setdiff(
+  names(resident_data_akde),
+  names(migratory_data_akde)
+)
+
+cat("\nColumns only in migratory datase<LOCAL_PATH>")
+print(migratory_only_columns)
+
+cat("\nColumns only in resident datase<LOCAL_PATH>")
+print(resident_only_columns)
+
+# bind_rows will automatically fill unavailable columns with NA
+# For example, id_phase may exist only for migratory rows.
+
+# ------------------------------------------------------------
+# 8) Combine datasets
+# ------------------------------------------------------------
+
+combined_deer_akde <- bind_rows(
+  migratory_data_akde,
+  resident_data_akde
+) %>%
+  arrange(dataset, id, date_time)
+
+cat("\nCombined rows:", nrow(combined_deer_akde), "\n")
+cat("Combined columns:", ncol(combined_deer_akde), "\n")
+cat("Unique IDs:", n_distinct(combined_deer_akde$id), "\n")
+
+# ------------------------------------------------------------
+# 9) Validation checks
+# ------------------------------------------------------------
+
+combined_summary <- combined_deer_akde %>%
+  group_by(dataset) %>%
+  summarise(
+    n_rows = n(),
+    n_ids = n_distinct(id),
+    min_date = min(date_time, na.rm = TRUE),
+    max_date = max(date_time, na.rm = TRUE),
+    n_rows_with_akde = sum(!is.na(akde_est)),
+    n_rows_without_akde = sum(is.na(akde_est)),
+    mean_akde_est = mean(akde_est, na.rm = TRUE),
+    median_akde_est = median(akde_est, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nCombined dataset summar<LOCAL_PATH>")
+print(combined_summary)
+
+# ------------------------------------------------------------
+# 10) Check for duplicated rows
+# ------------------------------------------------------------
+
+duplicate_check <- combined_deer_akde %>%
+  count(dataset, id, date_time, name = "n") %>%
+  filter(n > 1)
+
+cat("\nDuplicated dataset-ID-time combinations:", nrow(duplicate_check), "\n")
+
+if (nrow(duplicate_check) > 0) {
+  print(duplicate_check, n = Inf)
+}
+
+# ------------------------------------------------------------
+# 11) Check AKDE availability by ID
+# ------------------------------------------------------------
+
+akde_by_id <- combined_deer_akde %>%
+  group_by(dataset, id) %>%
+  summarise(
+    n_rows = n(),
+    n_akde_rows = sum(!is.na(akde_est)),
+    pct_rows_with_akde = round(
+      100 * n_akde_rows / n_rows,
+      2
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, id)
+
+cat("\nAKDE coverage by I<LOCAL_PATH>")
+print(akde_by_id, n = Inf)
+
+# ------------------------------------------------------------
+# 12) Save combined dataset and summaries
+# ------------------------------------------------------------
+
+write_csv(
+  combined_deer_akde,
+  combined_out_path
+)
+
+write_csv(
+  combined_summary,
+  file.path(
+    combined_out_dir,
+    "combined_migratory_resident_AKDE_summary.csv"
+  )
+)
+
+write_csv(
+  akde_by_id,
+  file.path(
+    combined_out_dir,
+    "combined_migratory_resident_AKDE_coverage_by_id.csv"
+  )
+)
+
+if (nrow(duplicate_check) > 0) {
+  write_csv(
+    duplicate_check,
+    file.path(
+      combined_out_dir,
+      "combined_migratory_resident_duplicate_check.csv"
+    )
+  )
+}
+
+cat("\n============================================================\n")
+cat("Combined dataset saved successfully.\n")
+cat("============================================================\n")
+
+cat("\nFinal combined CS<LOCAL_PATH>")
+cat(combined_out_path, "\n")
+
+```
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(readr)
+library(tidyr)
+
+# ============================================================
+# 1) Read combined dataset
+# ============================================================
+
+combined_data <- read_csv(
+  "<LOCAL_PATH>",
+  show_col_types = FALSE
+) %>%
+  mutate(
+    id = as.character(id),
+
+    date_time = parse_date_time(
+      date_time,
+      orders = c(
+        "Y-m-d H:M:S",
+        "Y-m-d HMS",
+        "Y-m-d HM",
+        "Y-m-d",
+        "mdy HMS",
+        "mdy HM",
+        "mdy"
+      ),
+      tz = "UTC"
+    )
+  )
+
+# ============================================================
+# 2) True migratory IDs
+# ============================================================
+
+true_migratory_ids <- c(
+  "F94", "F91", "F87", "F74", "F47", "F30", "F26", "F103",
+  "A61", "A60", "A58", "A57", "A56", "A49", "A48", "A44", "A29"
+)
+
+updated_migratory_data_4 <- combined_data %>%
+  filter(id %in% true_migratory_ids)
+
+cat(
+  "\nNumber of migratory IDs used:",
+  n_distinct(updated_migratory_data_4$id),
+  "\n"
+)
+
+# ============================================================
+# 3) Extract phase number
+#
+# Odd phases  = resident
+# Even phases = migratory
+# ============================================================
+
+migratory_split <- updated_migratory_data_4 %>%
+  mutate(
+    phase_text = str_to_lower(
+      str_trim(as.character(phases))
+    ),
+
+    phase_number = as.integer(
+      str_extract(
+        as.character(phases),
+        "\\d+"
+      )
+    )
+  ) %>%
+  filter(
+    phase_text != "remove",
+    !is.na(phase_number),
+    !is.na(date_time)
+  ) %>%
+  mutate(
+    range_type = case_when(
+      phase_number %% 2 == 1 ~ "resident_range",
+      phase_number %% 2 == 0 ~ "migratory_range",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("\nRecords by phas<LOCAL_PATH>")
+
+print(
+  migratory_split %>%
+    count(
+      phase_number,
+      range_type,
+      name = "n_records"
+    ) %>%
+    arrange(phase_number)
+)
+
+# ============================================================
+# 4) Find the start and end of every phase for every deer
+# ============================================================
+
+phase_dates_by_id <- migratory_split %>%
+  group_by(
+    id,
+    phase_number,
+    range_type
+  ) %>%
+  summarise(
+    phase_start = min(date_time, na.rm = TRUE),
+    phase_end   = max(date_time, na.rm = TRUE),
+    n_records   = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase_midpoint = phase_start +
+      as.numeric(
+        difftime(
+          phase_end,
+          phase_start,
+          units = "secs"
+        )
+      ) / 2
+  ) %>%
+  arrange(id, phase_start)
+
+cat("\nIndividual phase date<LOCAL_PATH>")
+print(phase_dates_by_id, n = Inf)
+
+# ============================================================
+# 5) Keep only migratory phases
+# ============================================================
+
+individual_migrations <- phase_dates_by_id %>%
+  filter(range_type == "migratory_range") %>%
+  arrange(id, phase_midpoint) %>%
+  group_by(id) %>%
+  mutate(
+    number_of_migrations = n(),
+    migration_order = row_number(),
+
+    # For deer with two migration phases:
+    # earliest migration = spring
+    # latest migration   = fall
+    #
+    # For deer with only one migration phase:
+    # classify according to the midpoint month.
+    migration_season = case_when(
+      number_of_migrations >= 2 &
+        migration_order == 1 ~ "spring",
+
+      number_of_migrations >= 2 &
+        migration_order == number_of_migrations ~ "fall",
+
+      number_of_migrations == 1 &
+        month(phase_midpoint) %in% 1:7 ~ "spring",
+
+      number_of_migrations == 1 &
+        month(phase_midpoint) %in% 8:12 ~ "fall",
+
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(migration_season))
+
+cat("\nIndividual migration classification<LOCAL_PATH>")
+
+print(
+  individual_migrations %>%
+    select(
+      id,
+      phase_number,
+      phase_start,
+      phase_end,
+      phase_midpoint,
+      migration_season
+    ),
+  n = Inf
+)
+
+# ============================================================
+# 6) Check how phases were classified
+# ============================================================
+
+cat("\nPhase classification count<LOCAL_PATH>")
+
+print(
+  individual_migrations %>%
+    count(
+      phase_number,
+      migration_season,
+      name = "n_deer"
+    ) %>%
+    arrange(migration_season, phase_number)
+)
+
+# ============================================================
+# 7) Standardize dates to the reference year 2000
+#
+# This removes the actual year while preserving month and day.
+# Year 2000 is used because it has 366 days.
+# ============================================================
+
+individual_migrations_std <- individual_migrations %>%
+  mutate(
+    migration_start_std = make_date(
+      year = 2000,
+      month = month(phase_start),
+      day = day(phase_start)
+    ),
+
+    migration_end_std = make_date(
+      year = 2000,
+      month = month(phase_end),
+      day = day(phase_end)
+    )
+  )
+
+# ============================================================
+# 8) Calculate herd-level MEDIAN migration dates
+# ============================================================
+
+herd_migration_summary <- individual_migrations_std %>%
+  group_by(migration_season) %>%
+  summarise(
+    n_ids = n_distinct(id),
+
+    median_migration_start = as.Date(
+      median(
+        as.numeric(migration_start_std),
+        na.rm = TRUE
+      ),
+      origin = "1970-01-01"
+    ),
+
+    median_migration_end = as.Date(
+      median(
+        as.numeric(migration_end_std),
+        na.rm = TRUE
+      ),
+      origin = "1970-01-01"
+    ),
+
+    earliest_migration_start = min(
+      migration_start_std,
+      na.rm = TRUE
+    ),
+
+    latest_migration_start = max(
+      migration_start_std,
+      na.rm = TRUE
+    ),
+
+    earliest_migration_end = min(
+      migration_end_std,
+      na.rm = TRUE
+    ),
+
+    latest_migration_end = max(
+      migration_end_std,
+      na.rm = TRUE
+    ),
+
+    .groups = "drop"
+  ) %>%
+  arrange(
+    factor(
+      migration_season,
+      levels = c("spring", "fall")
+    )
+  )
+
+cat("\nHerd-level median migration date<LOCAL_PATH>")
+print(herd_migration_summary, n = Inf)
+
+# ============================================================
+# 9) Put each deer's spring and fall dates on one row
+# ============================================================
+
+individual_season_dates <- individual_migrations_std %>%
+  select(
+    id,
+    migration_season,
+    migration_start_std,
+    migration_end_std
+  ) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = migration_season,
+    values_from = c(
+      migration_start_std,
+      migration_end_std
+    ),
+    names_glue = "{migration_season}_{.value}"
+  )
+
+# ============================================================
+# 10) Calculate summer and winter duration for each deer
+#
+# Winter:
+# fall migration end -> spring migration start
+#
+# Summer:
+# spring migration end -> fall migration start
+# ============================================================
+
+individual_season_lengths <- individual_season_dates %>%
+  filter(
+    !is.na(spring_migration_start_std),
+    !is.na(spring_migration_end_std),
+    !is.na(fall_migration_start_std),
+    !is.na(fall_migration_end_std)
+  ) %>%
+  mutate(
+    winter_start = fall_migration_end_std,
+    winter_end   = spring_migration_start_std,
+
+    summer_start = spring_migration_end_std,
+    summer_end   = fall_migration_start_std,
+
+    winter_start_day = yday(winter_start),
+    winter_end_day   = yday(winter_end),
+
+    summer_start_day = yday(summer_start),
+    summer_end_day   = yday(summer_end),
+
+    # Winter normally crosses December 31
+    winter_days = if_else(
+      winter_end_day >= winter_start_day,
+      winter_end_day - winter_start_day,
+      (366 - winter_start_day) + winter_end_day
+    ),
+
+    # Summer should normally occur within the same calendar year
+    summer_days = if_else(
+      summer_end_day >= summer_start_day,
+      summer_end_day - summer_start_day,
+      (366 - summer_start_day) + summer_end_day
+    )
+  ) %>%
+  select(
+    id,
+    winter_start,
+    winter_end,
+    winter_days,
+    summer_start,
+    summer_end,
+    summer_days
+  ) %>%
+  arrange(id)
+
+cat("\nIndividual deer season length<LOCAL_PATH>")
+print(individual_season_lengths, n = Inf)
+
+# ============================================================
+# 11) Herd-level MEDIAN season lengths
+#
+# The median duration is calculated from individual deer,
+# rather than subtracting independently calculated herd dates.
+# ============================================================
+
+season_length_summary <- individual_season_lengths %>%
+  summarise(
+    n_ids = n_distinct(id),
+
+    median_winter_start = as.Date(
+      median(
+        as.numeric(winter_start),
+        na.rm = TRUE
+      ),
+      origin = "1970-01-01"
+    ),
+
+    median_winter_end = as.Date(
+      median(
+        as.numeric(winter_end),
+        na.rm = TRUE
+      ),
+      origin = "1970-01-01"
+    ),
+
+    median_winter_days = median(
+      winter_days,
+      na.rm = TRUE
+    ),
+
+    median_summer_start = as.Date(
+      median(
+        as.numeric(summer_start),
+        na.rm = TRUE
+      ),
+      origin = "1970-01-01"
+    ),
+
+    median_summer_end = as.Date(
+      median(
+        as.numeric(summer_end),
+        na.rm = TRUE
+      ),
+      origin = "1970-01-01"
+    ),
+
+    median_summer_days = median(
+      summer_days,
+      na.rm = TRUE
+    )
+  )
+
+cat("\nMedian herd-level season summar<LOCAL_PATH>")
+print(season_length_summary)
+
+# ============================================================
+# 12) Additional duration statistics for verification
+# ============================================================
+
+season_duration_statistics <- individual_season_lengths %>%
+  summarise(
+    n_ids = n_distinct(id),
+
+    minimum_winter_days = min(
+      winter_days,
+      na.rm = TRUE
+    ),
+
+    q25_winter_days = quantile(
+      winter_days,
+      0.25,
+      na.rm = TRUE
+    ),
+
+    median_winter_days = median(
+      winter_days,
+      na.rm = TRUE
+    ),
+
+    q75_winter_days = quantile(
+      winter_days,
+      0.75,
+      na.rm = TRUE
+    ),
+
+    maximum_winter_days = max(
+      winter_days,
+      na.rm = TRUE
+    ),
+
+    minimum_summer_days = min(
+      summer_days,
+      na.rm = TRUE
+    ),
+
+    q25_summer_days = quantile(
+      summer_days,
+      0.25,
+      na.rm = TRUE
+    ),
+
+    median_summer_days = median(
+      summer_days,
+      na.rm = TRUE
+    ),
+
+    q75_summer_days = quantile(
+      summer_days,
+      0.75,
+      na.rm = TRUE
+    ),
+
+    maximum_summer_days = max(
+      summer_days,
+      na.rm = TRUE
+    )
+  )
+
+cat("\nSeason duration statistic<LOCAL_PATH>")
+print(season_duration_statistics)
+```
+
+```{r}
+# ============================================================
+# 13) Required packages for recalculating movement metrics
+# ============================================================
+
+library(slider)
+library(e1071)
+
+# ============================================================
+# 14) Pull the seasonal boundaries directly from the
+#     median herd-level season summary
+#
+# Winter:
+# median winter start -> December 31
+# January 1 -> median winter end
+#
+# Summer:
+# day after winter end -> day before winter start
+# ============================================================
+
+winter_start <- season_length_summary$median_winter_start[1]
+winter_end   <- season_length_summary$median_winter_end[1]
+
+cat("\nSeason boundaries use<LOCAL_PATH>")
+cat("Winter start:", as.character(winter_start), "\n")
+cat("Winter end:  ", as.character(winter_end), "\n")
+
+# ============================================================
+# 15) Prepare the complete dataset
+#
+# Remove rows labeled "Remove" but retain all resident and
+# migratory animals.
+# ============================================================
+
+all_data <- combined_data %>%
+  mutate(
+    id = as.character(id),
+
+    phase_text = str_to_lower(
+      str_trim(as.character(phases))
+    )
+  ) %>%
+  filter(
+    is.na(phase_text) |
+      phase_text != "remove"
+  ) %>%
+  filter(!is.na(date_time))
+
+# ============================================================
+# 16) Add the new season column
+#
+# Dates are normalized to the reference year 2000 so that
+# all years use the same seasonal boundaries.
+# ============================================================
+
+all_data <- all_data %>%
+  mutate(
+    date_std = make_date(
+      year = 2000,
+      month = month(date_time),
+      day = day(date_time)
+    ),
+
+    season = case_when(
+      date_std >= winter_start |
+        date_std <= winter_end ~ "winter",
+
+      TRUE ~ "summer"
+    ),
+
+    season = factor(
+      season,
+      levels = c("winter", "summer")
+    )
+  )
+
+cat("\nSeasonal breakdow<LOCAL_PATH>")
+print(all_data %>% count(season))
+
+cat("\nSeasonal breakdown by I<LOCAL_PATH>")
+print(
+  all_data %>%
+    group_by(id, season) %>%
+    summarise(
+      n_records = n(),
+      .groups = "drop"
+    ),
+  n = Inf
+)
+
+# ============================================================
+# 17) Identify coordinate columns
+# ============================================================
+
+possible_x_columns <- c(
+  "x",
+  "X",
+  "utm_x",
+  "UTM_X",
+  "easting",
+  "Easting",
+  "east",
+  "longitude",
+  "Longitude",
+  "lon",
+  "long"
+)
+
+possible_y_columns <- c(
+  "y",
+  "Y",
+  "utm_y",
+  "UTM_Y",
+  "northing",
+  "Northing",
+  "north",
+  "latitude",
+  "Latitude",
+  "lat"
+)
+
+x_col <- possible_x_columns[
+  possible_x_columns %in% names(all_data)
+][1]
+
+y_col <- possible_y_columns[
+  possible_y_columns %in% names(all_data)
+][1]
+
+if (is.na(x_col) || is.na(y_col)) {
+  stop(
+    paste0(
+      "Could not identify the coordinate columns.\n\n",
+      "Available column<LOCAL_PATH>",
+      paste(names(all_data), collapse = ", ")
+    )
+  )
+}
+
+cat("\nCoordinate columns detecte<LOCAL_PATH>")
+cat("X coordinate:", x_col, "\n")
+cat("Y coordinate:", y_col, "\n")
+
+all_data <- all_data %>%
+  mutate(
+    coord_x = suppressWarnings(
+      as.numeric(.data[[x_col]])
+    ),
+
+    coord_y = suppressWarnings(
+      as.numeric(.data[[y_col]])
+    )
+  ) %>%
+  filter(
+    is.finite(coord_x),
+    is.finite(coord_y)
+  )
+
+# ============================================================
+# 18) Helper functions
+# ============================================================
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) == 0) {
+    return(NA_real_)
+  }
+
+  mean(x)
+}
+
+safe_var <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) < 2) {
+    return(NA_real_)
+  }
+
+  var(x)
+}
+
+safe_sd <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) < 2) {
+    return(NA_real_)
+  }
+
+  sd(x)
+}
+
+safe_skewness <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (
+    length(x) < 3 ||
+      sd(x) == 0
+  ) {
+    return(NA_real_)
+  }
+
+  e1071::skewness(
+    x,
+    na.rm = TRUE,
+    type = 2
+  )
+}
+
+safe_kurtosis <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (
+    length(x) < 4 ||
+      sd(x) == 0
+  ) {
+    return(NA_real_)
+  }
+
+  e1071::kurtosis(
+    x,
+    na.rm = TRUE,
+    type = 2
+  )
+}
+
+wrap_angle <- function(x) {
+  atan2(
+    sin(x),
+    cos(x)
+  )
+}
+
+rolling_sinuosity_function <- function(x, y) {
+  valid <- is.finite(x) & is.finite(y)
+
+  x <- x[valid]
+  y <- y[valid]
+
+  if (length(x) < 2) {
+    return(NA_real_)
+  }
+
+  net_displacement <- sqrt(
+    (x[length(x)] - x[1])^2 +
+      (y[length(y)] - y[1])^2
+  )
+
+  path_length <- sum(
+    sqrt(
+      diff(x)^2 +
+        diff(y)^2
+    ),
+    na.rm = TRUE
+  )
+
+  if (
+    !is.finite(path_length) ||
+      path_length <= 0
+  ) {
+    return(NA_real_)
+  }
+
+  net_displacement / path_length
+}
+
+# ============================================================
+# 19) Recalculate basic movement metrics
+#
+# Metrics are calculated separately for each ID and season.
+# This prevents movement steps or rolling windows from crossing
+# between winter and summer.
+# ============================================================
+
+all_data <- all_data %>%
+  arrange(
+    id,
+    season,
+    date_time
+  ) %>%
+  group_by(
+    id,
+    season
+  ) %>%
+  mutate(
+    # Coordinate change between consecutive fixes
+    dx = coord_x - lag(coord_x),
+    dy = coord_y - lag(coord_y),
+
+    # Time between consecutive fixes in seconds
+    dt = as.numeric(
+      difftime(
+        date_time,
+        lag(date_time),
+        units = "secs"
+      )
+    ),
+
+    # Step distance
+    dist = sqrt(
+      dx^2 +
+        dy^2
+    ),
+
+    # Remove invalid time intervals
+    dt = if_else(
+      is.na(dt) |
+        dt <= 0,
+      NA_real_,
+      dt
+    ),
+
+    dist = if_else(
+      is.na(dt),
+      NA_real_,
+      dist
+    ),
+
+    # Velocity
+    velo = dist / dt,
+
+    # Absolute bearing angle
+    abs_angle = atan2(
+      dy,
+      dx
+    ),
+
+    # Relative turn angle
+    rel_angle = wrap_angle(
+      abs_angle -
+        lag(abs_angle)
+    ),
+
+    # Absolute relative turn angle
+    abs_rel_angle = abs(
+      rel_angle
+    ),
+
+    # R2n:
+    # squared displacement from the first point of each
+    # ID-season trajectory
+    r2n = (
+      coord_x -
+        first(coord_x)
+    )^2 + (
+      coord_y -
+        first(coord_y)
+    )^2,
+
+    # Optional uppercase version for compatibility
+    R2n = r2n
+  ) %>%
+  ungroup()
+
+# ============================================================
+# 20) Recalculate rolling 56-fix sinuosity
+#
+# Current observation plus previous 55 observations.
+# ============================================================
+
+all_data <- all_data %>%
+  arrange(
+    id,
+    season,
+    date_time
+  ) %>%
+  group_by(
+    id,
+    season
+  ) %>%
+  mutate(
+    sinuosity = slide2_dbl(
+      coord_x,
+      coord_y,
+      .f = rolling_sinuosity_function,
+      .before = 55,
+      .after = 0,
+      .complete = FALSE
+    )
+  ) %>%
+  ungroup()
+
+# ============================================================
+# 21) Recalculate 56-fix rolling movement metrics
+#
+# Current observation plus previous 55 observations.
+# ============================================================
+
+all_data <- all_data %>%
+  arrange(
+    id,
+    season,
+    date_time
+  ) %>%
+  group_by(
+    id,
+    season
+  ) %>%
+  mutate(
+    # --------------------------------------------------------
+    # Absolute relative turn angle
+    # --------------------------------------------------------
+
+    rolling_abs_rel_angle_mean = slide_dbl(
+      abs_rel_angle,
+      safe_mean,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_abs_rel_angle_var = slide_dbl(
+      abs_rel_angle,
+      safe_var,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_abs_rel_angle_sd = slide_dbl(
+      abs_rel_angle,
+      safe_sd,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_abs_rel_angle_skew = slide_dbl(
+      abs_rel_angle,
+      safe_skewness,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_abs_rel_angle_kurt = slide_dbl(
+      abs_rel_angle,
+      safe_kurtosis,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    # --------------------------------------------------------
+    # Velocity
+    # --------------------------------------------------------
+
+    rolling_velo_mean = slide_dbl(
+      velo,
+      safe_mean,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_velo_var = slide_dbl(
+      velo,
+      safe_var,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_velo_sd = slide_dbl(
+      velo,
+      safe_sd,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_velo_skew = slide_dbl(
+      velo,
+      safe_skewness,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_velo_kurt = slide_dbl(
+      velo,
+      safe_kurtosis,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    # --------------------------------------------------------
+    # R2n
+    # --------------------------------------------------------
+
+    rolling_r2n_mean = slide_dbl(
+      r2n,
+      safe_mean,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_r2n_var = slide_dbl(
+      r2n,
+      safe_var,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_r2n_sd = slide_dbl(
+      r2n,
+      safe_sd,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_r2n_skew = slide_dbl(
+      r2n,
+      safe_skewness,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_r2n_kurt = slide_dbl(
+      r2n,
+      safe_kurtosis,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    # --------------------------------------------------------
+    # Sinuosity
+    # --------------------------------------------------------
+
+    rolling_sinuosity_mean = slide_dbl(
+      sinuosity,
+      safe_mean,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_sinuosity_var = slide_dbl(
+      sinuosity,
+      safe_var,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_sinuosity_sd = slide_dbl(
+      sinuosity,
+      safe_sd,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_sinuosity_skew = slide_dbl(
+      sinuosity,
+      safe_skewness,
+      .before = 55,
+      .complete = FALSE
+    ),
+
+    rolling_sinuosity_kurt = slide_dbl(
+      sinuosity,
+      safe_kurtosis,
+      .before = 55,
+      .complete = FALSE
+    )
+  ) %>%
+  ungroup()
+
+# ============================================================
+# 22) Find the CWD status column
+# ============================================================
+
+possible_cwd_columns <- c(
+  "CWD_Status",
+  "cwd_status",
+  "CWD.status",
+  "cwd.status",
+  "CWD",
+  "cwd",
+  "status",
+  "Status"
+)
+
+cwd_col <- possible_cwd_columns[
+  possible_cwd_columns %in% names(all_data)
+][1]
+
+if (is.na(cwd_col)) {
+  stop(
+    paste0(
+      "Could not identify the CWD status column.\n\n",
+      "Available column<LOCAL_PATH>",
+      paste(names(all_data), collapse = ", ")
+    )
+  )
+}
+
+cat("\nCWD status column detected:", cwd_col, "\n")
+
+# ============================================================
+# 23) Standardize CWD status
+# ============================================================
+
+all_data <- all_data %>%
+  mutate(
+    cwd_status_original = as.character(
+      .data[[cwd_col]]
+    ),
+
+    cwd_status_clean = str_to_lower(
+      str_trim(cwd_status_original)
+    ),
+
+    CWD_Status_Final = case_when(
+      cwd_status_clean %in% c(
+        "cwd-",
+        "cwd negative",
+        "cwd-negative",
+        "negative",
+        "neg",
+        "0",
+        "false",
+        "unaffected"
+      ) ~ "CWD-",
+
+      cwd_status_clean %in% c(
+        "cwd+",
+        "cwd positive",
+        "cwd-positive",
+        "positive",
+        "pos",
+        "1",
+        "true",
+        "affected"
+      ) ~ "CWD+",
+
+      str_detect(
+        cwd_status_clean,
+        "positive|cwd\\+|affected"
+      ) ~ "CWD+",
+
+      str_detect(
+        cwd_status_clean,
+        "negative|cwd-|unaffected"
+      ) ~ "CWD-",
+
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("\nCWD status chec<LOCAL_PATH>")
+
+print(
+  all_data %>%
+    count(
+      cwd_status_original,
+      CWD_Status_Final,
+      sort = TRUE
+    ),
+  n = Inf
+)
+
+# ============================================================
+# 24) Split all CWD-negative into training
+#     and all CWD-positive into testing
+# ============================================================
+
+training_data <- all_data %>%
+  filter(
+    CWD_Status_Final == "CWD-"
+  ) %>%
+  arrange(
+    id,
+    season,
+    date_time
+  )
+
+testing_data <- all_data %>%
+  filter(
+    CWD_Status_Final == "CWD+"
+  ) %>%
+  arrange(
+    id,
+    season,
+    date_time
+  )
+
+# ============================================================
+# 25) Verify the split
+# ============================================================
+
+cat("\nTraining data — all CWD-negativ<LOCAL_PATH>")
+
+print(
+  training_data %>%
+    summarise(
+      n_rows = n(),
+      n_ids = n_distinct(id),
+      winter_rows = sum(season == "winter"),
+      summer_rows = sum(season == "summer")
+    )
+)
+
+cat("\nTesting data — all CWD-positiv<LOCAL_PATH>")
+
+print(
+  testing_data %>%
+    summarise(
+      n_rows = n(),
+      n_ids = n_distinct(id),
+      winter_rows = sum(season == "winter"),
+      summer_rows = sum(season == "summer")
+    )
+)
+
+# Check that no ID appears in both datasets
+overlapping_ids <- intersect(
+  unique(training_data$id),
+  unique(testing_data$id)
+)
+
+cat(
+  "\nNumber of IDs appearing in both training and testing:",
+  length(overlapping_ids),
+  "\n"
+)
+
+if (length(overlapping_ids) > 0) {
+  print(overlapping_ids)
+}
+
+# ============================================================
+# 26) Save the final datasets
+#
+# The season column is included in all three files.
+# ============================================================
+
+output_folder <- "<LOCAL_PATH>"
+
+write_csv(
+  all_data,
+  file.path(
+    output_folder,
+    "all_deer_with_new_seasons_and_recalculated_metrics.csv"
+  )
+)
+
+write_csv(
+  training_data,
+  file.path(
+    output_folder,
+    "CWD_negative_training_with_seasons2.csv"
+  )
+)
+
+write_csv(
+  testing_data,
+  file.path(
+    output_folder,
+    "CWD_positive_testing_with_seasons2.csv"
+  )
+)
+
+cat("\nFiles successfully save<LOCAL_PATH>")
+
+cat(
+  file.path(
+    output_folder,
+    "all_deer_with_new_seasons_and_recalculated_metrics2.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    output_folder,
+    "CWD_negative_training_with_seasons2.csv"
+  ),
+  "\n"
+)
+
+cat(
+  file.path(
+    output_folder,
+    "CWD_positive_testing_with_seasons2.csv"
+  ),
+  "\n"
+)
+
+```
+

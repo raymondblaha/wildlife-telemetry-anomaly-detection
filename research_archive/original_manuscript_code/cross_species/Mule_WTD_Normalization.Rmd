@@ -1,0 +1,5668 @@
+---
+title: "Mule_WTD_Normalization"
+author: "Raymond Blaha"
+date: "2026-10-05"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# CROSS-SPECIES GPS REGULARIZATION
+# WHITE-TAILED DEER + MULE DEER
+#
+# FINAL REGULARIZATION POLICY
+#
+# White-tailed deer:
+#   target hours = 00:00, 09:00, 18:00
+#
+# Mule deer:
+#   target hours = 00:00, 08:00, 16:00
+#
+# Daily inclusion:
+#   retain animal-days with >= 2 of 3 target fixes
+#
+# Trajectory continuity:
+#   start a new segment if gap > 16 hours
+#
+# Training = CWD-
+# Testing  = CWD+
+#
+# IMPORTANT:
+#   Movement metrics should be recalculated AFTER this script,
+#   using id + segment_id as grouping variables.
+# ============================================================
+
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+
+
+# ============================================================
+# 2. COLUMN SETTINGS
+# ============================================================
+
+ID_COL <- "id"
+
+DATETIME_COL <- "date_time"
+
+SEASON_COL <- "season"
+
+
+# ============================================================
+# 3. SPECIES-SPECIFIC TARGET HOURS
+# ============================================================
+
+# White-tailed deer originally follow approximately
+# a 3-hour schedule.
+#
+# Select three actual scheduled observations/day.
+
+WTD_TARGET_HOURS <- c(
+  0,
+  9,
+  18
+)
+
+
+# Mule deer predominantly follow approximately
+# an 8-hour schedule.
+
+MULE_TARGET_HOURS <- c(
+  0,
+  8,
+  16
+)
+
+
+# ============================================================
+# 4. REGULARIZATION SETTINGS
+# ============================================================
+
+# Maximum difference between target time and actual fix
+# allowed for assignment.
+
+MAX_TIME_DIFFERENCE_MIN <- 120
+
+
+# Minimum number of retained target fixes required
+# for an animal-day.
+
+MIN_FIXES_PER_DAY <- 2
+
+
+# A new trajectory segment begins if the gap between
+# consecutive retained observations exceeds this value.
+
+MAX_CONTINUOUS_GAP_HOURS <- 16
+
+
+# ============================================================
+# 5. FILE PATHS
+# ============================================================
+
+WTD_TRAIN_FILE <-
+  "<LOCAL_PATH>"
+
+WTD_TEST_FILE <-
+  "<LOCAL_PATH>"
+
+MULE_TRAIN_FILE <-
+  "<LOCAL_PATH>"
+
+MULE_TEST_FILE <-
+  "<LOCAL_PATH>"
+
+
+# ============================================================
+# 6. OUTPUT FOLDER
+# ============================================================
+
+OUTPUT_DIR <-
+  "<LOCAL_PATH>"
+
+
+dir.create(
+  OUTPUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# ============================================================
+# 7. LOAD DATA
+# ============================================================
+
+wtd_train_raw <- read_csv(
+  WTD_TRAIN_FILE,
+  show_col_types = FALSE
+)
+
+wtd_test_raw <- read_csv(
+  WTD_TEST_FILE,
+  show_col_types = FALSE
+)
+
+mule_train_raw <- read_csv(
+  MULE_TRAIN_FILE,
+  show_col_types = FALSE
+)
+
+mule_test_raw <- read_csv(
+  MULE_TEST_FILE,
+  show_col_types = FALSE
+)
+
+
+# ============================================================
+# 8. CHECK REQUIRED COLUMNS
+# ============================================================
+
+check_required_columns <- function(
+    data,
+    dataset_name
+) {
+
+  required <- c(
+    ID_COL,
+    DATETIME_COL
+  )
+
+  missing_cols <- setdiff(
+    required,
+    names(data)
+  )
+
+  if (length(missing_cols) > 0) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " is missing required columns: ",
+        paste(
+          missing_cols,
+          collapse = ", "
+        )
+      )
+    )
+  }
+}
+
+
+check_required_columns(
+  wtd_train_raw,
+  "WTD CWD- training"
+)
+
+check_required_columns(
+  wtd_test_raw,
+  "WTD CWD+ testing"
+)
+
+check_required_columns(
+  mule_train_raw,
+  "Mule deer CWD- training"
+)
+
+check_required_columns(
+  mule_test_raw,
+  "Mule deer CWD+ testing"
+)
+
+
+# ============================================================
+# 9. ROBUST DATETIME PARSER
+#
+# Does NOT use parse_date_time().
+# ============================================================
+
+parse_gps_datetime <- function(x) {
+
+  x <- as.character(x)
+
+  x <- trimws(x)
+
+
+  # ----------------------------------------------------------
+  # Replace ISO "T"
+  # ----------------------------------------------------------
+
+  x <- gsub(
+    "T",
+    " ",
+    x,
+    fixed = TRUE
+  )
+
+
+  # ----------------------------------------------------------
+  # Remove trailing Z
+  # ----------------------------------------------------------
+
+  x <- gsub(
+    "Z$",
+    "",
+    x
+  )
+
+
+  # ----------------------------------------------------------
+  # Remove fractional seconds
+  # ----------------------------------------------------------
+
+  x <- sub(
+    "\\.[0-9]+$",
+    "",
+    x
+  )
+
+
+  # ----------------------------------------------------------
+  # Initialize POSIXct output
+  # ----------------------------------------------------------
+
+  out <- as.POSIXct(
+    rep(
+      NA_character_,
+      length(x)
+    ),
+    tz = "UTC"
+  )
+
+
+  # ----------------------------------------------------------
+  # YYYY-MM-DD HH:MM:SS
+  # ----------------------------------------------------------
+
+  bad <- is.na(out) & !is.na(x)
+
+  if (any(bad)) {
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = "%Y-%m-%d %H:%M:%S",
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # YYYY-MM-DD HH:MM
+  # ----------------------------------------------------------
+
+  bad <- is.na(out) & !is.na(x)
+
+  if (any(bad)) {
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = "%Y-%m-%d %H:%M",
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # MM/DD/YYYY HH:MM:SS
+  # ----------------------------------------------------------
+
+  bad <- is.na(out) & !is.na(x)
+
+  if (any(bad)) {
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = "%m/%d/%Y %H:%M:%S",
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # MM/DD/YYYY HH:MM
+  # ----------------------------------------------------------
+
+  bad <- is.na(out) & !is.na(x)
+
+  if (any(bad)) {
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = "%m/%d/%Y %H:%M",
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # YYYY/MM/DD HH:MM:SS
+  # ----------------------------------------------------------
+
+  bad <- is.na(out) & !is.na(x)
+
+  if (any(bad)) {
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = "%Y/%m/%d %H:%M:%S",
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # YYYY/MM/DD HH:MM
+  # ----------------------------------------------------------
+
+  bad <- is.na(out) & !is.na(x)
+
+  if (any(bad)) {
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = "%Y/%m/%d %H:%M",
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  return(out)
+}
+
+
+# ============================================================
+# 10. PREPARE GPS DATA
+# ============================================================
+
+prepare_gps <- function(
+    data,
+    species_name,
+    cwd_status,
+    dataset_type
+) {
+
+  # ----------------------------------------------------------
+  # Standardize ID and datetime source fields
+  # ----------------------------------------------------------
+
+  data[[ID_COL]] <-
+    as.character(
+      data[[ID_COL]]
+    )
+
+
+  data[[DATETIME_COL]] <-
+    as.character(
+      data[[DATETIME_COL]]
+    )
+
+
+  # ----------------------------------------------------------
+  # Parse standardized datetime
+  # ----------------------------------------------------------
+
+  data$.datetime <-
+    parse_gps_datetime(
+      data[[DATETIME_COL]]
+    )
+
+
+  # ----------------------------------------------------------
+  # Parsing diagnostics
+  # ----------------------------------------------------------
+
+  n_total <-
+    nrow(data)
+
+  n_failed <-
+    sum(
+      is.na(data$.datetime)
+    )
+
+  n_success <-
+    n_total -
+    n_failed
+
+
+  cat(
+    "\n\n====================================\n",
+    species_name,
+    " ",
+    cwd_status,
+    "\n",
+    "====================================\n",
+    sep = ""
+  )
+
+
+  cat(
+    "Successfully parsed: ",
+    n_success,
+    " / ",
+    n_total,
+    "\n",
+    sep = ""
+  )
+
+
+  cat(
+    "Failed to parse: ",
+    n_failed,
+    "\n",
+    sep = ""
+  )
+
+
+  if (n_success == 0) {
+
+    cat(
+      "\nFirst 10 datetime value<LOCAL_PATH>"
+    )
+
+    print(
+      head(
+        data[[DATETIME_COL]],
+        10
+      )
+    )
+
+    stop(
+      paste0(
+        "No timestamps could be parsed for ",
+        species_name,
+        " ",
+        cwd_status
+      )
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # Drop unparseable timestamps
+  # ----------------------------------------------------------
+
+  data <- data %>%
+
+    filter(
+      !is.na(.datetime)
+    )
+
+
+  # ----------------------------------------------------------
+  # Create standardized date and labels
+  # ----------------------------------------------------------
+
+  data <- data %>%
+
+    mutate(
+
+      .date =
+        as.Date(
+          .datetime,
+          tz = "UTC"
+        ),
+
+      species =
+        species_name,
+
+      cwd_group =
+        cwd_status,
+
+      dataset =
+        dataset_type
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Remove conflicting original date field
+  # ----------------------------------------------------------
+
+  data <- data %>%
+
+    select(
+      -any_of("date")
+    )
+
+
+  return(data)
+}
+
+
+# ============================================================
+# 11. PREPARE ALL FOUR DATASETS
+# ============================================================
+
+wtd_train_raw <- prepare_gps(
+
+  data =
+    wtd_train_raw,
+
+  species_name =
+    "White-tailed deer",
+
+  cwd_status =
+    "CWD-",
+
+  dataset_type =
+    "training"
+
+)
+
+
+wtd_test_raw <- prepare_gps(
+
+  data =
+    wtd_test_raw,
+
+  species_name =
+    "White-tailed deer",
+
+  cwd_status =
+    "CWD+",
+
+  dataset_type =
+    "testing"
+
+)
+
+
+mule_train_raw <- prepare_gps(
+
+  data =
+    mule_train_raw,
+
+  species_name =
+    "Mule deer",
+
+  cwd_status =
+    "CWD-",
+
+  dataset_type =
+    "training"
+
+)
+
+
+mule_test_raw <- prepare_gps(
+
+  data =
+    mule_test_raw,
+
+  species_name =
+    "Mule deer",
+
+  cwd_status =
+    "CWD+",
+
+  dataset_type =
+    "testing"
+
+)
+
+
+# ============================================================
+# 12. REGULARIZATION FUNCTION
+# ============================================================
+
+regularize_gps <- function(
+    data,
+    target_hours,
+    max_difference_min =
+      MAX_TIME_DIFFERENCE_MIN
+) {
+
+  # ----------------------------------------------------------
+  # Grouping variables
+  # ----------------------------------------------------------
+
+  grouping_vars <- c(
+    ID_COL,
+    ".date"
+  )
+
+
+  if (
+    !is.null(SEASON_COL) &&
+    SEASON_COL %in% names(data)
+  ) {
+
+    grouping_vars <- c(
+      ID_COL,
+      SEASON_COL,
+      ".date"
+    )
+
+  }
+
+
+  # ----------------------------------------------------------
+  # Unique animal-days
+  # ----------------------------------------------------------
+
+  animal_days <- data %>%
+
+    distinct(
+
+      across(
+        all_of(
+          grouping_vars
+        )
+      )
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Generate target times
+  # ----------------------------------------------------------
+
+  target_times <- animal_days %>%
+
+    tidyr::crossing(
+
+      target_hour =
+        target_hours
+
+    ) %>%
+
+    mutate(
+
+      target_datetime =
+
+        as.POSIXct(
+          .date,
+          tz = "UTC"
+        ) +
+
+        hours(
+          target_hour
+        )
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Match actual observations to target times
+  # ----------------------------------------------------------
+
+  candidates <- target_times %>%
+
+    inner_join(
+
+      data,
+
+      by =
+        grouping_vars,
+
+      relationship =
+        "many-to-many"
+
+    ) %>%
+
+    mutate(
+
+      time_difference_min =
+
+        abs(
+
+          as.numeric(
+
+            difftime(
+
+              .datetime,
+
+              target_datetime,
+
+              units =
+                "mins"
+
+            )
+
+          )
+
+        )
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Restrict to observations close enough to target
+  # ----------------------------------------------------------
+
+  candidates <- candidates %>%
+
+    filter(
+
+      time_difference_min <=
+        max_difference_min
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Select nearest actual fix for each target
+  # ----------------------------------------------------------
+
+  target_group_vars <- c(
+    grouping_vars,
+    "target_hour"
+  )
+
+
+  regularized <- candidates %>%
+
+    group_by(
+
+      across(
+        all_of(
+          target_group_vars
+        )
+      )
+
+    ) %>%
+
+    slice_min(
+
+      order_by =
+        time_difference_min,
+
+      n =
+        1,
+
+      with_ties =
+        FALSE
+
+    ) %>%
+
+    ungroup()
+
+
+  # ----------------------------------------------------------
+  # Prevent one actual fix from filling >1 target
+  # ----------------------------------------------------------
+
+  regularized <- regularized %>%
+
+    arrange(
+
+      .data[[ID_COL]],
+
+      .datetime,
+
+      time_difference_min
+
+    ) %>%
+
+    distinct(
+
+      .data[[ID_COL]],
+
+      .datetime,
+
+      .keep_all =
+        TRUE
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Sort
+  # ----------------------------------------------------------
+
+  regularized <- regularized %>%
+
+    arrange(
+
+      .data[[ID_COL]],
+
+      .datetime
+
+    )
+
+
+  return(
+    regularized
+  )
+}
+
+
+# ============================================================
+# 13. REGULARIZE WTD
+# ============================================================
+
+wtd_train_reg <- regularize_gps(
+
+  data =
+    wtd_train_raw,
+
+  target_hours =
+    WTD_TARGET_HOURS
+
+)
+
+
+wtd_test_reg <- regularize_gps(
+
+  data =
+    wtd_test_raw,
+
+  target_hours =
+    WTD_TARGET_HOURS
+
+)
+
+
+# ============================================================
+# 14. REGULARIZE MULE DEER
+# ============================================================
+
+mule_train_reg <- regularize_gps(
+
+  data =
+    mule_train_raw,
+
+  target_hours =
+    MULE_TARGET_HOURS
+
+)
+
+
+mule_test_reg <- regularize_gps(
+
+  data =
+    mule_test_raw,
+
+  target_hours =
+    MULE_TARGET_HOURS
+
+)
+
+
+# ============================================================
+# 15. DAILY FIX DISTRIBUTION BEFORE FILTERING
+# ============================================================
+
+summarize_daily_fixes <- function(data) {
+
+  data %>%
+
+    count(
+
+      .data[[ID_COL]],
+
+      .date,
+
+      name =
+        "n_fixes"
+
+    ) %>%
+
+    count(
+
+      n_fixes,
+
+      name =
+        "n_animal_days"
+
+    ) %>%
+
+    mutate(
+
+      percent =
+
+        round(
+
+          100 *
+            n_animal_days /
+            sum(
+              n_animal_days
+            ),
+
+          2
+
+        )
+
+    ) %>%
+
+    arrange(
+      n_fixes
+    )
+}
+
+
+cat(
+  "\n\n====================================\n",
+  "WTD CWD- BEFORE >=2 FILTER\n",
+  "====================================\n"
+)
+
+print(
+  summarize_daily_fixes(
+    wtd_train_reg
+  )
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "WTD CWD+ BEFORE >=2 FILTER\n",
+  "====================================\n"
+)
+
+print(
+  summarize_daily_fixes(
+    wtd_test_reg
+  )
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "MULE CWD- BEFORE >=2 FILTER\n",
+  "====================================\n"
+)
+
+print(
+  summarize_daily_fixes(
+    mule_train_reg
+  )
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "MULE CWD+ BEFORE >=2 FILTER\n",
+  "====================================\n"
+)
+
+print(
+  summarize_daily_fixes(
+    mule_test_reg
+  )
+)
+
+
+# ============================================================
+# 16. KEEP DAYS WITH AT LEAST 2 TARGET FIXES
+# ============================================================
+
+keep_minimum_daily_fixes <- function(
+    data,
+    minimum_fixes =
+      MIN_FIXES_PER_DAY
+) {
+
+  data %>%
+
+    group_by(
+
+      .data[[ID_COL]],
+
+      .date
+
+    ) %>%
+
+    filter(
+
+      n() >=
+        minimum_fixes
+
+    ) %>%
+
+    ungroup()
+}
+
+
+wtd_train_reg <-
+  keep_minimum_daily_fixes(
+    wtd_train_reg
+  )
+
+
+wtd_test_reg <-
+  keep_minimum_daily_fixes(
+    wtd_test_reg
+  )
+
+
+mule_train_reg <-
+  keep_minimum_daily_fixes(
+    mule_train_reg
+  )
+
+
+mule_test_reg <-
+  keep_minimum_daily_fixes(
+    mule_test_reg
+  )
+
+
+# ============================================================
+# 17. STANDARDIZE LABELS
+# ============================================================
+
+wtd_train_reg <- wtd_train_reg %>%
+
+  mutate(
+
+    species =
+      "White-tailed deer",
+
+    cwd_group =
+      "CWD-",
+
+    dataset =
+      "training"
+
+  )
+
+
+wtd_test_reg <- wtd_test_reg %>%
+
+  mutate(
+
+    species =
+      "White-tailed deer",
+
+    cwd_group =
+      "CWD+",
+
+    dataset =
+      "testing"
+
+  )
+
+
+mule_train_reg <- mule_train_reg %>%
+
+  mutate(
+
+    species =
+      "Mule deer",
+
+    cwd_group =
+      "CWD-",
+
+    dataset =
+      "training"
+
+  )
+
+
+mule_test_reg <- mule_test_reg %>%
+
+  mutate(
+
+    species =
+      "Mule deer",
+
+    cwd_group =
+      "CWD+",
+
+    dataset =
+      "testing"
+
+  )
+
+
+# ============================================================
+# 18. ADD TRAJECTORY SEGMENTS
+#
+# New segment begins when:
+#
+#   - first observation for animal
+#   - time gap > 16 hours
+#
+# Movement metrics must later be grouped by:
+#
+#   id + segment_id
+#
+# ============================================================
+
+add_segments <- function(data) {
+
+  data %>%
+
+    arrange(
+
+      .data[[ID_COL]],
+
+      .datetime
+
+    ) %>%
+
+    group_by(
+      .data[[ID_COL]]
+    ) %>%
+
+    mutate(
+
+      gap_hours =
+
+        as.numeric(
+
+          difftime(
+
+            .datetime,
+
+            lag(
+              .datetime
+            ),
+
+            units =
+              "hours"
+
+          )
+
+        ),
+
+
+      new_segment =
+
+        if_else(
+
+          is.na(
+            gap_hours
+          ) |
+
+            gap_hours >
+              MAX_CONTINUOUS_GAP_HOURS,
+
+          1L,
+
+          0L
+
+        ),
+
+
+      segment_id =
+        cumsum(
+          new_segment
+        )
+
+    ) %>%
+
+    ungroup()
+}
+
+
+wtd_train_reg <-
+  add_segments(
+    wtd_train_reg
+  )
+
+
+wtd_test_reg <-
+  add_segments(
+    wtd_test_reg
+  )
+
+
+mule_train_reg <-
+  add_segments(
+    mule_train_reg
+  )
+
+
+mule_test_reg <-
+  add_segments(
+    mule_test_reg
+  )
+
+
+# ============================================================
+# 19. VERIFY ANIMAL COUNTS
+# ============================================================
+
+animal_count_check <- tibble(
+
+  dataset = c(
+
+    "WTD CWD-",
+
+    "WTD CWD+",
+
+    "Mule CWD-",
+
+    "Mule CWD+"
+
+  ),
+
+  n_animals = c(
+
+    n_distinct(
+      wtd_train_reg[[ID_COL]]
+    ),
+
+    n_distinct(
+      wtd_test_reg[[ID_COL]]
+    ),
+
+    n_distinct(
+      mule_train_reg[[ID_COL]]
+    ),
+
+    n_distinct(
+      mule_test_reg[[ID_COL]]
+    )
+
+  )
+
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "ANIMAL COUNT CHECK\n",
+  "====================================\n"
+)
+
+
+print(
+  animal_count_check
+)
+
+
+# Expected:
+#
+# WTD CWD-      40
+# WTD CWD+      19
+# Mule CWD-     47
+# Mule CWD+     60
+
+
+# ============================================================
+# 20. FINAL DAILY SUMMARY TABLES
+# ============================================================
+
+make_daily_summary <- function(data) {
+
+  data %>%
+
+    count(
+
+      species,
+
+      cwd_group,
+
+      dataset,
+
+      .data[[ID_COL]],
+
+      .date,
+
+      name =
+        "n_fixes"
+
+    )
+}
+
+
+wtd_train_daily <-
+  make_daily_summary(
+    wtd_train_reg
+  )
+
+
+wtd_test_daily <-
+  make_daily_summary(
+    wtd_test_reg
+  )
+
+
+mule_train_daily <-
+  make_daily_summary(
+    mule_train_reg
+  )
+
+
+mule_test_daily <-
+  make_daily_summary(
+    mule_test_reg
+  )
+
+
+daily_summary <- bind_rows(
+
+  wtd_train_daily,
+
+  wtd_test_daily,
+
+  mule_train_daily,
+
+  mule_test_daily
+
+)
+
+
+# ============================================================
+# 21. FINAL FIX DISTRIBUTION
+# ============================================================
+
+fix_distribution <- daily_summary %>%
+
+  count(
+
+    species,
+
+    cwd_group,
+
+    dataset,
+
+    n_fixes,
+
+    name =
+      "n_animal_days"
+
+  ) %>%
+
+  group_by(
+
+    species,
+
+    cwd_group,
+
+    dataset
+
+  ) %>%
+
+  mutate(
+
+    percent =
+
+      round(
+
+        100 *
+          n_animal_days /
+          sum(
+            n_animal_days
+          ),
+
+        2
+
+      )
+
+  ) %>%
+
+  ungroup()
+
+
+cat(
+  "\n\n====================================\n",
+  "FINAL FIX DISTRIBUTION\n",
+  "====================================\n"
+)
+
+
+print(
+  fix_distribution,
+  n = Inf
+)
+
+
+# ============================================================
+# 22. FINAL DATASET SUMMARY
+# ============================================================
+
+dataset_summary <- daily_summary %>%
+
+  group_by(
+
+    species,
+
+    cwd_group,
+
+    dataset
+
+  ) %>%
+
+  summarise(
+
+    n_animals =
+      n_distinct(
+        .data[[ID_COL]]
+      ),
+
+    n_animal_days =
+      n(),
+
+    n_locations =
+      sum(
+        n_fixes
+      ),
+
+    mean_fixes_per_day =
+      mean(
+        n_fixes
+      ),
+
+    median_fixes_per_day =
+      median(
+        n_fixes
+      ),
+
+    percent_2_fixes =
+
+      round(
+
+        100 *
+          mean(
+            n_fixes == 2
+          ),
+
+        2
+
+      ),
+
+    percent_3_fixes =
+
+      round(
+
+        100 *
+          mean(
+            n_fixes == 3
+          ),
+
+        2
+
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "FINAL DATASET SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  dataset_summary
+)
+
+
+# ============================================================
+# 23. INTERVAL SUMMARY
+# ============================================================
+
+summarize_intervals <- function(
+    data,
+    species_name,
+    cwd_status,
+    dataset_type
+) {
+
+  valid_gaps <-
+    data$gap_hours[
+      !is.na(
+        data$gap_hours
+      )
+    ]
+
+
+  tibble(
+
+    species =
+      species_name,
+
+    cwd_group =
+      cwd_status,
+
+    dataset =
+      dataset_type,
+
+    median_hours =
+      median(
+        valid_gaps,
+        na.rm = TRUE
+      ),
+
+    mean_hours =
+      mean(
+        valid_gaps,
+        na.rm = TRUE
+      ),
+
+    sd_hours =
+      sd(
+        valid_gaps,
+        na.rm = TRUE
+      )
+
+  )
+}
+
+
+interval_summary <- bind_rows(
+
+  summarize_intervals(
+    wtd_train_reg,
+    "White-tailed deer",
+    "CWD-",
+    "training"
+  ),
+
+  summarize_intervals(
+    wtd_test_reg,
+    "White-tailed deer",
+    "CWD+",
+    "testing"
+  ),
+
+  summarize_intervals(
+    mule_train_reg,
+    "Mule deer",
+    "CWD-",
+    "training"
+  ),
+
+  summarize_intervals(
+    mule_test_reg,
+    "Mule deer",
+    "CWD+",
+    "testing"
+  )
+
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "INTERVAL SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  interval_summary
+)
+
+
+# ============================================================
+# 24. LARGE GAP / SEGMENT SUMMARY
+# ============================================================
+
+summarize_segments <- function(
+    data,
+    species_name,
+    cwd_status,
+    dataset_type
+) {
+
+  tibble(
+
+    species =
+      species_name,
+
+    cwd_group =
+      cwd_status,
+
+    dataset =
+      dataset_type,
+
+    n_locations =
+      nrow(
+        data
+      ),
+
+    n_segments =
+      n_distinct(
+        interaction(
+          data[[ID_COL]],
+          data$segment_id
+        )
+      ),
+
+    gaps_over_16h =
+      sum(
+        data$gap_hours >
+          MAX_CONTINUOUS_GAP_HOURS,
+        na.rm = TRUE
+      ),
+
+    percent_gaps_over_16h =
+
+      round(
+
+        100 *
+          mean(
+            data$gap_hours >
+              MAX_CONTINUOUS_GAP_HOURS,
+            na.rm = TRUE
+          ),
+
+        2
+
+      )
+
+  )
+}
+
+
+segment_summary <- bind_rows(
+
+  summarize_segments(
+    wtd_train_reg,
+    "White-tailed deer",
+    "CWD-",
+    "training"
+  ),
+
+  summarize_segments(
+    wtd_test_reg,
+    "White-tailed deer",
+    "CWD+",
+    "testing"
+  ),
+
+  summarize_segments(
+    mule_train_reg,
+    "Mule deer",
+    "CWD-",
+    "training"
+  ),
+
+  summarize_segments(
+    mule_test_reg,
+    "Mule deer",
+    "CWD+",
+    "testing"
+  )
+
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "SEGMENT SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  segment_summary
+)
+
+
+# ============================================================
+# 25. RETENTION SUMMARY
+# ============================================================
+
+retention_summary <- tibble(
+
+  species = c(
+
+    "White-tailed deer",
+    "White-tailed deer",
+    "Mule deer",
+    "Mule deer"
+
+  ),
+
+  cwd_group = c(
+
+    "CWD-",
+    "CWD+",
+    "CWD-",
+    "CWD+"
+
+  ),
+
+  dataset = c(
+
+    "training",
+    "testing",
+    "training",
+    "testing"
+
+  ),
+
+  original_n = c(
+
+    nrow(
+      wtd_train_raw
+    ),
+
+    nrow(
+      wtd_test_raw
+    ),
+
+    nrow(
+      mule_train_raw
+    ),
+
+    nrow(
+      mule_test_raw
+    )
+
+  ),
+
+  final_n = c(
+
+    nrow(
+      wtd_train_reg
+    ),
+
+    nrow(
+      wtd_test_reg
+    ),
+
+    nrow(
+      mule_train_reg
+    ),
+
+    nrow(
+      mule_test_reg
+    )
+
+  )
+
+) %>%
+
+  mutate(
+
+    removed_n =
+      original_n -
+      final_n,
+
+    retained_percent =
+
+      round(
+
+        100 *
+          final_n /
+          original_n,
+
+        2
+
+      )
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "RETENTION SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  retention_summary
+)
+
+
+# ============================================================
+# 26. ANIMAL-LEVEL SUMMARY
+# ============================================================
+
+summarize_animals <- function(
+    data
+) {
+
+  data %>%
+
+    group_by(
+      .data[[ID_COL]]
+    ) %>%
+
+    summarise(
+
+      species =
+        first(
+          species
+        ),
+
+      cwd_group =
+        first(
+          cwd_group
+        ),
+
+      dataset =
+        first(
+          dataset
+        ),
+
+      n_locations =
+        n(),
+
+      n_days =
+        n_distinct(
+          .date
+        ),
+
+      n_segments =
+        n_distinct(
+          segment_id
+        ),
+
+      .groups =
+        "drop"
+
+    )
+}
+
+
+animal_summary <- bind_rows(
+
+  summarize_animals(
+    wtd_train_reg
+  ),
+
+  summarize_animals(
+    wtd_test_reg
+  ),
+
+  summarize_animals(
+    mule_train_reg
+  ),
+
+  summarize_animals(
+    mule_test_reg
+  )
+
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "ANIMAL-LEVEL SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+
+  animal_summary %>%
+
+    group_by(
+
+      species,
+
+      cwd_group,
+
+      dataset
+
+    ) %>%
+
+    summarise(
+
+      n_animals =
+        n(),
+
+      min_days =
+        min(
+          n_days
+        ),
+
+      median_days =
+        median(
+          n_days
+        ),
+
+      mean_days =
+        mean(
+          n_days
+        ),
+
+      max_days =
+        max(
+          n_days
+        ),
+
+      median_segments =
+        median(
+          n_segments
+        ),
+
+      max_segments =
+        max(
+          n_segments
+        ),
+
+      .groups =
+        "drop"
+
+    )
+
+)
+
+
+# ============================================================
+# 27. SEGMENT-LENGTH SUMMARY
+#
+# Important for the next step because an ~11-fix rolling
+# window requires segments long enough to contain 11 fixes.
+# ============================================================
+
+get_segment_lengths <- function(data) {
+
+  data %>%
+
+    count(
+
+      species,
+
+      cwd_group,
+
+      dataset,
+
+      .data[[ID_COL]],
+
+      segment_id,
+
+      name =
+        "n_fixes_segment"
+
+    )
+}
+
+
+segment_lengths <- bind_rows(
+
+  get_segment_lengths(
+    wtd_train_reg
+  ),
+
+  get_segment_lengths(
+    wtd_test_reg
+  ),
+
+  get_segment_lengths(
+    mule_train_reg
+  ),
+
+  get_segment_lengths(
+    mule_test_reg
+  )
+
+)
+
+
+segment_length_summary <- segment_lengths %>%
+
+  group_by(
+
+    species,
+
+    cwd_group,
+
+    dataset
+
+  ) %>%
+
+  summarise(
+
+    n_segments =
+      n(),
+
+    median_fixes_segment =
+      median(
+        n_fixes_segment
+      ),
+
+    mean_fixes_segment =
+      mean(
+        n_fixes_segment
+      ),
+
+    percent_segments_11plus =
+
+      round(
+
+        100 *
+          mean(
+            n_fixes_segment >= 11
+          ),
+
+        2
+
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "SEGMENT LENGTH SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  segment_length_summary
+)
+
+
+# ============================================================
+# 28. SAVE FINAL REGULARIZED DATASETS
+# ============================================================
+
+write_csv(
+
+  wtd_train_reg,
+
+  file.path(
+    OUTPUT_DIR,
+    "WTD_CWD_negative_regularized_3target_min2_segmented.csv"
+  )
+
+)
+
+
+write_csv(
+
+  wtd_test_reg,
+
+  file.path(
+    OUTPUT_DIR,
+    "WTD_CWD_positive_regularized_3target_min2_segmented.csv"
+  )
+
+)
+
+
+write_csv(
+
+  mule_train_reg,
+
+  file.path(
+    OUTPUT_DIR,
+    "MuleDeer_CWD_negative_regularized_3target_min2_segmented.csv"
+  )
+
+)
+
+
+write_csv(
+
+  mule_test_reg,
+
+  file.path(
+    OUTPUT_DIR,
+    "MuleDeer_CWD_positive_regularized_3target_min2_segmented.csv"
+  )
+
+)
+
+
+# ============================================================
+# 29. SAVE DIAGNOSTICS
+# ============================================================
+
+write_csv(
+
+  fix_distribution,
+
+  file.path(
+    OUTPUT_DIR,
+    "fix_distribution.csv"
+  )
+
+)
+
+
+write_csv(
+
+  dataset_summary,
+
+  file.path(
+    OUTPUT_DIR,
+    "dataset_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  interval_summary,
+
+  file.path(
+    OUTPUT_DIR,
+    "interval_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  segment_summary,
+
+  file.path(
+    OUTPUT_DIR,
+    "segment_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  retention_summary,
+
+  file.path(
+    OUTPUT_DIR,
+    "retention_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  animal_summary,
+
+  file.path(
+    OUTPUT_DIR,
+    "animal_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  segment_lengths,
+
+  file.path(
+    OUTPUT_DIR,
+    "segment_lengths.csv"
+  )
+
+)
+
+
+write_csv(
+
+  segment_length_summary,
+
+  file.path(
+    OUTPUT_DIR,
+    "segment_length_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  animal_count_check,
+
+  file.path(
+    OUTPUT_DIR,
+    "animal_count_check.csv"
+  )
+
+)
+
+
+# ============================================================
+# 30. FINAL MESSAGE
+# ============================================================
+
+cat(
+  "\n\n====================================\n",
+  "FINAL REGULARIZATION COMPLETE\n",
+  "====================================\n"
+)
+
+
+cat(
+  "\nOutput folde<LOCAL_PATH>",
+  OUTPUT_DIR,
+  "\n"
+)
+
+
+cat(
+  "\nFinal locations retaine<LOCAL_PATH>"
+)
+
+
+cat(
+  "WTD CWD-: ",
+  nrow(
+    wtd_train_reg
+  ),
+  "\n",
+  sep = ""
+)
+
+
+cat(
+  "WTD CWD+: ",
+  nrow(
+    wtd_test_reg
+  ),
+  "\n",
+  sep = ""
+)
+
+
+cat(
+  "Mule deer CWD-: ",
+  nrow(
+    mule_train_reg
+  ),
+  "\n",
+  sep = ""
+)
+
+
+cat(
+  "Mule deer CWD+: ",
+  nrow(
+    mule_test_reg
+  ),
+  "\n",
+  sep = ""
+)
+
+
+cat(
+  "\nFinal polic<LOCAL_PATH>",
+  "- WTD target times: 00, 09, 18\n",
+  "- Mule target times: 00, 08, 16\n",
+  "- Minimum fixes/day: ",
+  MIN_FIXES_PER_DAY,
+  "\n",
+  "- Segment break threshold: ",
+  MAX_CONTINUOUS_GAP_HOURS,
+  " hours\n",
+  sep = ""
+)
+
+
+cat(
+  "\nReview these object<LOCAL_PATH>",
+  "1. animal_count_check\n",
+  "2. fix_distribution\n",
+  "3. dataset_summary\n",
+  "4. interval_summary\n",
+  "5. segment_summary\n",
+  "6. retention_summary\n",
+  "7. animal_summary\n",
+  "8. segment_length_summary\n\n"
+)
+
+```
+
+### Review printing
+```{r}
+animal_count_check
+dataset_summary
+segment_summary
+segment_length_summary
+```
+
+### Checking for Phases columns 
+```{r}
+# ============================================================
+# SEARCH FOR POSSIBLE PHASE / MIGRATION COLUMNS
+# ============================================================
+
+find_phase_columns <- function(data, dataset_name) {
+
+  possible_cols <- names(data)[
+    grepl(
+      "phase|migration|migr|season|state|period|range|movement",
+      names(data),
+      ignore.case = TRUE
+    )
+  ]
+
+  cat(
+    "\n\n====================================\n",
+    dataset_name,
+    "\n",
+    "====================================\n",
+    sep = ""
+  )
+
+  cat(
+    "Possible phase-related column<LOCAL_PATH>"
+  )
+
+  print(
+    possible_cols
+  )
+
+  invisible(
+    possible_cols
+  )
+}
+
+
+wtd_train_phase_cols <- find_phase_columns(
+  wtd_train_raw,
+  "WTD CWD- TRAINING"
+)
+
+wtd_test_phase_cols <- find_phase_columns(
+  wtd_test_raw,
+  "WTD CWD+ TESTING"
+)
+
+mule_train_phase_cols <- find_phase_columns(
+  mule_train_raw,
+  "MULE DEER CWD- TRAINING"
+)
+
+mule_test_phase_cols <- find_phase_columns(
+  mule_test_raw,
+  "MULE DEER CWD+ TESTING"
+)
+
+```
+
+### AKDE again
+```{r}
+# ============================================================
+# CROSS-SPECIES AKDE RECALCULATION
+# WTD + MULE DEER
+#
+# Uses FINAL REGULARIZED GPS DATA
+#
+# Classification rule:
+#
+#   RESIDENT:
+#     ID has only Phase_1
+#
+#   MULTI-PHASE / MIGRATORY:
+#     ID has Phase_1 plus one or more additional phases
+#
+# AKDE policy retained from previous analysis:
+#
+#   - sliding 7-day windows
+#   - minimum 20 fixes per ID / ID-phase
+#   - minimum 20 fixes per 7-day window
+#   - variogram(..., CI = "Gauss")
+#   - variogram.fit(..., name = "GuessBM")
+#   - ctmm.select(..., IC = "BIC")
+#   - akde(..., weights = TRUE)
+#   - extract CI low / est / high exactly as before
+#
+# IMPORTANT:
+#   No area-unit conversion is introduced here.
+#   low / est / high are extracted the same way as in the
+#   previous AKDE code.
+# ============================================================
+
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(tibble)
+library(purrr)
+library(furrr)
+library(future)
+library(ctmm)
+library(lubridate)
+
+
+# ============================================================
+# 2. PATHS
+# ============================================================
+
+BASE_DIR <-
+  "<LOCAL_PATH>"
+
+
+REG_DIR <-
+  file.path(
+    BASE_DIR,
+    "regularized_cross_species"
+  )
+
+
+AKDE_OUT_DIR <-
+  file.path(
+    BASE_DIR,
+    "regularized_cross_species",
+    "AKDE_recalculated"
+  )
+
+
+dir.create(
+  AKDE_OUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# ============================================================
+# 3. INPUT FILES
+# ============================================================
+
+WTD_TRAIN_FILE <- file.path(
+  REG_DIR,
+  "WTD_CWD_negative_regularized_3target_min2_segmented.csv"
+)
+
+WTD_TEST_FILE <- file.path(
+  REG_DIR,
+  "WTD_CWD_positive_regularized_3target_min2_segmented.csv"
+)
+
+MULE_TRAIN_FILE <- file.path(
+  REG_DIR,
+  "MuleDeer_CWD_negative_regularized_3target_min2_segmented.csv"
+)
+
+MULE_TEST_FILE <- file.path(
+  REG_DIR,
+  "MuleDeer_CWD_positive_regularized_3target_min2_segmented.csv"
+)
+
+
+# ============================================================
+# 4. AKDE SETTINGS
+# ============================================================
+
+WINDOW_DAYS <- 7
+
+MIN_TOTAL_FIXES <- 20
+
+MIN_WINDOW_FIXES <- 20
+
+
+# Keep parallelism moderate because ctmm models can use
+# substantial RAM.
+
+N_WORKERS <- max(
+  1,
+  min(
+    4,
+    parallel::detectCores() - 1
+  )
+)
+
+
+# ============================================================
+# 5. LOAD FINAL REGULARIZED DATA
+# ============================================================
+
+wtd_train <- read_csv(
+  WTD_TRAIN_FILE,
+  show_col_types = FALSE
+)
+
+wtd_test <- read_csv(
+  WTD_TEST_FILE,
+  show_col_types = FALSE
+)
+
+mule_train <- read_csv(
+  MULE_TRAIN_FILE,
+  show_col_types = FALSE
+)
+
+mule_test <- read_csv(
+  MULE_TEST_FILE,
+  show_col_types = FALSE
+)
+
+
+# ============================================================
+# 6. ROBUST DATETIME PARSER
+#
+# Avoids parse_date_time() / regexpr issue encountered earlier.
+# ============================================================
+
+parse_gps_datetime <- function(x) {
+
+  x <- as.character(x)
+  x <- trimws(x)
+
+  x <- gsub(
+    "T",
+    " ",
+    x,
+    fixed = TRUE
+  )
+
+  x <- gsub(
+    "Z$",
+    "",
+    x
+  )
+
+  x <- sub(
+    "\\.[0-9]+$",
+    "",
+    x
+  )
+
+
+  out <- as.POSIXct(
+    rep(
+      NA_character_,
+      length(x)
+    ),
+    tz = "UTC"
+  )
+
+
+  formats <- c(
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M"
+  )
+
+
+  for (fmt in formats) {
+
+    bad <- is.na(out) & !is.na(x)
+
+    if (!any(bad)) {
+      break
+    }
+
+    out[bad] <- suppressWarnings(
+      as.POSIXct(
+        x[bad],
+        format = fmt,
+        tz = "UTC"
+      )
+    )
+  }
+
+
+  out
+}
+
+
+# ============================================================
+# 7. STANDARDIZE DATETIME
+# ============================================================
+
+standardize_datetime <- function(data) {
+
+  if (".datetime" %in% names(data)) {
+
+    data$.datetime <-
+      parse_gps_datetime(
+        data$.datetime
+      )
+
+  } else if ("date_time" %in% names(data)) {
+
+    data$.datetime <-
+      parse_gps_datetime(
+        data$date_time
+      )
+
+  } else {
+
+    stop(
+      "Neither .datetime nor date_time was found."
+    )
+  }
+
+
+  data %>%
+    filter(
+      !is.na(.datetime)
+    )
+}
+
+
+wtd_train <- standardize_datetime(
+  wtd_train
+)
+
+wtd_test <- standardize_datetime(
+  wtd_test
+)
+
+mule_train <- standardize_datetime(
+  mule_train
+)
+
+mule_test <- standardize_datetime(
+  mule_test
+)
+
+
+# ============================================================
+# 8. STANDARDIZE PHASE LABELS
+# ============================================================
+#
+# We use "phases" because that was the phase field used
+# in the previous AKDE workflow.
+#
+# Examples:
+#
+#   Phase 1
+#   Phase_1
+#   phase 1
+#
+# all become:
+#
+#   Phase_1
+# ============================================================
+
+clean_phase <- function(x) {
+
+  x <- as.character(x)
+
+  x <- str_trim(x)
+
+  x <- str_squish(x)
+
+  x <- str_replace_all(
+    x,
+    "_",
+    " "
+  )
+
+  x_lower <- str_to_lower(x)
+
+
+  # Explicit remove labels stay NA
+  x_lower[
+    x_lower %in%
+      c(
+        "",
+        "na",
+        "remove"
+      )
+  ] <- NA_character_
+
+
+  phase_num <- str_extract(
+    x_lower,
+    "\\d+"
+  )
+
+
+  result <- ifelse(
+
+    !is.na(
+      phase_num
+    ),
+
+    paste0(
+      "Phase_",
+      phase_num
+    ),
+
+    ifelse(
+      is.na(x_lower),
+      NA_character_,
+      str_replace_all(
+        str_to_title(x),
+        "\\s+",
+        "_"
+      )
+    )
+  )
+
+
+  result
+}
+
+
+# ============================================================
+# 9. PREPARE DATA FOR AKDE
+# ============================================================
+
+prepare_akde_data <- function(
+    data,
+    species_name,
+    cwd_status,
+    dataset_type
+) {
+
+  required_cols <- c(
+    "id",
+    "longitude",
+    "latitude",
+    "phases",
+    ".datetime"
+  )
+
+
+  missing_cols <- setdiff(
+    required_cols,
+    names(data)
+  )
+
+
+  if (length(missing_cols) > 0) {
+
+    stop(
+      paste0(
+        species_name,
+        " ",
+        cwd_status,
+        " missing columns: ",
+        paste(
+          missing_cols,
+          collapse = ", "
+        )
+      )
+    )
+  }
+
+
+  data %>%
+
+    mutate(
+
+      id =
+        as.character(
+          id
+        ),
+
+      longitude =
+        as.numeric(
+          longitude
+        ),
+
+      latitude =
+        as.numeric(
+          latitude
+        ),
+
+      phase_label =
+        clean_phase(
+          phases
+        ),
+
+      species =
+        species_name,
+
+      cwd_group =
+        cwd_status,
+
+      dataset =
+        dataset_type
+
+    ) %>%
+
+    filter(
+
+      is.finite(
+        longitude
+      ),
+
+      is.finite(
+        latitude
+      ),
+
+      !is.na(
+        .datetime
+      ),
+
+      !is.na(
+        phase_label
+      )
+
+    )
+}
+
+
+wtd_train_akde <- prepare_akde_data(
+  wtd_train,
+  "White-tailed deer",
+  "CWD-",
+  "training"
+)
+
+wtd_test_akde <- prepare_akde_data(
+  wtd_test,
+  "White-tailed deer",
+  "CWD+",
+  "testing"
+)
+
+mule_train_akde <- prepare_akde_data(
+  mule_train,
+  "Mule deer",
+  "CWD-",
+  "training"
+)
+
+mule_test_akde <- prepare_akde_data(
+  mule_test,
+  "Mule deer",
+  "CWD+",
+  "testing"
+)
+
+
+# ============================================================
+# 10. CLASSIFY EACH ID AS RESIDENT OR MULTI-PHASE
+#
+# FINAL RULE:
+#
+# Resident =
+#   exactly one usable phase AND that phase == Phase_1
+#
+# Multi-phase =
+#   more than one phase
+#
+# Anything else is flagged for inspection.
+# ============================================================
+
+classify_phase_structure <- function(data) {
+
+  data %>%
+
+    distinct(
+      id,
+      phase_label
+    ) %>%
+
+    group_by(
+      id
+    ) %>%
+
+    summarise(
+
+      n_phases =
+        n_distinct(
+          phase_label
+        ),
+
+      phase_list =
+        paste(
+          sort(
+            unique(
+              phase_label
+            )
+          ),
+          collapse = ";"
+        ),
+
+      akde_class = case_when(
+
+        n_phases == 1 &
+          phase_list == "Phase_1" ~
+          "resident",
+
+        n_phases > 1 ~
+          "multi_phase",
+
+        TRUE ~
+          "check"
+
+      ),
+
+      .groups =
+        "drop"
+
+    )
+}
+
+
+# ============================================================
+# 11. PHASE CLASSIFICATION FOR ALL FOUR DATASETS
+# ============================================================
+
+wtd_train_class <-
+  classify_phase_structure(
+    wtd_train_akde
+  )
+
+wtd_test_class <-
+  classify_phase_structure(
+    wtd_test_akde
+  )
+
+mule_train_class <-
+  classify_phase_structure(
+    mule_train_akde
+  )
+
+mule_test_class <-
+  classify_phase_structure(
+    mule_test_akde
+  )
+
+
+phase_classification <- bind_rows(
+
+  wtd_train_class %>%
+    mutate(
+      species = "White-tailed deer",
+      cwd_group = "CWD-",
+      dataset = "training"
+    ),
+
+  wtd_test_class %>%
+    mutate(
+      species = "White-tailed deer",
+      cwd_group = "CWD+",
+      dataset = "testing"
+    ),
+
+  mule_train_class %>%
+    mutate(
+      species = "Mule deer",
+      cwd_group = "CWD-",
+      dataset = "training"
+    ),
+
+  mule_test_class %>%
+    mutate(
+      species = "Mule deer",
+      cwd_group = "CWD+",
+      dataset = "testing"
+    )
+
+)
+
+
+cat(
+  "\n\n====================================\n",
+  "PHASE CLASSIFICATION\n",
+  "====================================\n"
+)
+
+
+print(
+  phase_classification %>%
+    count(
+      species,
+      cwd_group,
+      dataset,
+      akde_class
+    ),
+  n = Inf
+)
+
+
+# ============================================================
+# 12. CHECK ANY UNEXPECTED PHASE STRUCTURES
+# ============================================================
+
+phase_problems <- phase_classification %>%
+
+  filter(
+    akde_class == "check"
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "PHASE GROUPS NEEDING REVIEW\n",
+  "====================================\n"
+)
+
+
+print(
+  phase_problems,
+  n = Inf
+)
+
+
+# ============================================================
+# 13. ADD CLASSIFICATION BACK TO EACH DATASET
+# ============================================================
+
+wtd_train_akde <- wtd_train_akde %>%
+
+  left_join(
+    wtd_train_class,
+    by = "id"
+  )
+
+
+wtd_test_akde <- wtd_test_akde %>%
+
+  left_join(
+    wtd_test_class,
+    by = "id"
+  )
+
+
+mule_train_akde <- mule_train_akde %>%
+
+  left_join(
+    mule_train_class,
+    by = "id"
+  )
+
+
+mule_test_akde <- mule_test_akde %>%
+
+  left_join(
+    mule_test_class,
+    by = "id"
+  )
+
+
+# ============================================================
+# 14. BUILD RESIDENT / MULTI-PHASE GROUP IDENTIFIERS
+# ============================================================
+
+add_akde_group <- function(data) {
+
+  data %>%
+
+    mutate(
+
+      akde_group = case_when(
+
+        akde_class ==
+          "resident" ~
+          id,
+
+        akde_class ==
+          "multi_phase" ~
+          paste(
+            id,
+            phase_label,
+            sep = "_"
+          ),
+
+        TRUE ~
+          NA_character_
+
+      )
+
+    ) %>%
+
+    filter(
+      !is.na(
+        akde_group
+      )
+    )
+}
+
+
+wtd_train_akde <-
+  add_akde_group(
+    wtd_train_akde
+  )
+
+wtd_test_akde <-
+  add_akde_group(
+    wtd_test_akde
+  )
+
+mule_train_akde <-
+  add_akde_group(
+    mule_train_akde
+  )
+
+mule_test_akde <-
+  add_akde_group(
+    mule_test_akde
+  )
+
+
+# ============================================================
+# 15. BUILD CTMM TELEMETRY INPUT
+# ============================================================
+
+make_telemetry_input <- function(data) {
+
+  data %>%
+
+    transmute(
+
+      individual.local.identifier =
+        akde_group,
+
+      location.long =
+        longitude,
+
+      location.lat =
+        latitude,
+
+      timestamp =
+        .datetime
+
+    ) %>%
+
+    arrange(
+      individual.local.identifier,
+      timestamp
+    ) %>%
+
+    distinct(
+
+      individual.local.identifier,
+
+      timestamp,
+
+      .keep_all =
+        TRUE
+
+    )
+}
+
+
+# ============================================================
+# 16. GENERIC SLIDING-WINDOW AKDE FUNCTION
+# ============================================================
+
+run_akde_dataset <- function(
+    data,
+    dataset_name
+) {
+
+  cat(
+    "\n\n====================================\n",
+    "AKDE DATASET: ",
+    dataset_name,
+    "\n",
+    "====================================\n",
+    sep = ""
+  )
+
+
+  # ----------------------------------------------------------
+  # Telemetry dataframe
+  # ----------------------------------------------------------
+
+  tel_input <-
+    make_telemetry_input(
+      data
+    )
+
+
+  cat(
+    "Telemetry rows: ",
+    nrow(tel_input),
+    "\n",
+    sep = ""
+  )
+
+
+  cat(
+    "AKDE groups: ",
+    n_distinct(
+      tel_input$individual.local.identifier
+    ),
+    "\n",
+    sep = ""
+  )
+
+
+  # ----------------------------------------------------------
+  # Convert to ctmm telemetry
+  # ----------------------------------------------------------
+
+  tel_list <- as.telemetry(
+
+    tel_input,
+
+    timeformat =
+      "%Y-%m-%d %H:%M:%S",
+
+    timezone =
+      "UTC"
+
+  )
+
+
+  # ----------------------------------------------------------
+  # Metadata lookup
+  # ----------------------------------------------------------
+
+  metadata <- data %>%
+
+    distinct(
+
+      akde_group,
+
+      id,
+
+      phase_label,
+
+      akde_class,
+
+      species,
+
+      cwd_group,
+
+      dataset
+
+    )
+
+
+  # ----------------------------------------------------------
+  # Per-group processor
+  # ----------------------------------------------------------
+
+  process_one_group <- function(group_name) {
+
+    tel <- tel_list[[group_name]]
+
+
+    day_sec <-
+      24 * 3600
+
+
+    window_sec <-
+      WINDOW_DAYS *
+      day_sec
+
+
+    # --------------------------------------------------------
+    # Safety check
+    # --------------------------------------------------------
+
+    if (is.null(tel)) {
+
+      return(
+
+        list(
+
+          area =
+            tibble(),
+
+          uds =
+            list(),
+
+          status =
+            tibble(
+
+              akde_group =
+                group_name,
+
+              status =
+                "missing telemetry",
+
+              n_fixes =
+                NA_integer_,
+
+              candidate_windows =
+                0L,
+
+              successful_windows =
+                0L
+
+            )
+
+        )
+
+      )
+    }
+
+
+    n_fixes <-
+      length(
+        tel$t
+      )
+
+
+    # --------------------------------------------------------
+    # Minimum total observations
+    # --------------------------------------------------------
+
+    if (
+      n_fixes <
+        MIN_TOTAL_FIXES
+    ) {
+
+      return(
+
+        list(
+
+          area =
+            tibble(),
+
+          uds =
+            list(),
+
+          status =
+            tibble(
+
+              akde_group =
+                group_name,
+
+              status =
+                "skipped fewer than 20 total fixes",
+
+              n_fixes =
+                n_fixes,
+
+              candidate_windows =
+                0L,
+
+              successful_windows =
+                0L
+
+            )
+
+        )
+
+      )
+    }
+
+
+    # --------------------------------------------------------
+    # Candidate sliding-window starts
+    # --------------------------------------------------------
+
+    starts <-
+      tel$t[
+        tel$t <=
+          max(tel$t) -
+          window_sec
+      ]
+
+
+    if (
+      length(starts) ==
+        0
+    ) {
+
+      return(
+
+        list(
+
+          area =
+            tibble(),
+
+          uds =
+            list(),
+
+          status =
+            tibble(
+
+              akde_group =
+                group_name,
+
+              status =
+                "skipped no full 7-day windows",
+
+              n_fixes =
+                n_fixes,
+
+              candidate_windows =
+                0L,
+
+              successful_windows =
+                0L
+
+            )
+
+        )
+
+      )
+    }
+
+
+    # --------------------------------------------------------
+    # Output containers
+    # --------------------------------------------------------
+
+    area_rows <-
+      tibble(
+
+        window_start =
+          as.POSIXct(
+            character(),
+            tz = "UTC"
+          ),
+
+        n_window_fixes =
+          integer(),
+
+        low =
+          numeric(),
+
+        est =
+          numeric(),
+
+        high =
+          numeric()
+
+      )
+
+
+    ud_list <-
+      list()
+
+
+    n_eligible_windows <-
+      0L
+
+
+    # --------------------------------------------------------
+    # Sliding windows
+    # --------------------------------------------------------
+
+    for (
+      t0 in starts
+    ) {
+
+      win <-
+        tel[
+
+          tel$t >= t0 &
+
+            tel$t <=
+              (
+                t0 +
+                  window_sec
+              ),
+
+        ]
+
+
+      n_window <-
+        length(
+          win$t
+        )
+
+
+      # ------------------------------------------------------
+      # SAME minimum-window requirement as prior AKDE
+      # ------------------------------------------------------
+
+      if (
+        n_window <
+          MIN_WINDOW_FIXES
+      ) {
+
+        next
+      }
+
+
+      n_eligible_windows <-
+        n_eligible_windows +
+        1L
+
+
+      # ------------------------------------------------------
+      # SAME AKDE MODELING PROCEDURE
+      # ------------------------------------------------------
+
+      UD <- tryCatch(
+        {
+
+          v0 <-
+            variogram(
+              win,
+              CI = "Gauss"
+            )
+
+
+          v2 <-
+            variogram.fit(
+              v0,
+              name = "GuessBM",
+              interactive = FALSE
+            )
+
+
+          m0 <-
+            ctmm.select(
+              win,
+              v2,
+              IC = "BIC"
+            )
+
+
+          akde(
+            win,
+            m0,
+            weights = TRUE
+          )
+
+        },
+
+        error = function(e) {
+
+          message(
+            "AKDE failed for ",
+            group_name,
+            " at ",
+            as.POSIXct(
+              t0,
+              origin = "1970-01-01",
+              tz = "UTC"
+            ),
+            ": ",
+            e$message
+          )
+
+
+          NULL
+        }
+      )
+
+
+      if (
+        is.null(UD)
+      ) {
+
+        next
+      }
+
+
+      # ------------------------------------------------------
+      # SAME CI EXTRACTION AS OLD CODE
+      # ------------------------------------------------------
+
+      ci <- tryCatch(
+        {
+
+          summary(
+            UD
+          )$CI
+
+        },
+
+        error = function(e) {
+
+          NULL
+
+        }
+      )
+
+
+      if (
+        is.null(ci)
+      ) {
+
+        next
+      }
+
+
+      ci_tbl <- as_tibble(
+        ci,
+        rownames = "unit"
+      )
+
+
+      area_row <- ci_tbl %>%
+
+        filter(
+          str_starts(
+            unit,
+            "area"
+          )
+        ) %>%
+
+        select(
+          low,
+          est,
+          high
+        )
+
+
+      if (
+        nrow(area_row) ==
+          0
+      ) {
+
+        next
+      }
+
+
+      # ------------------------------------------------------
+      # Keep successful UD
+      # ------------------------------------------------------
+
+      ud_list[[length(ud_list) + 1]] <- UD
+
+
+      # ------------------------------------------------------
+      # Area row
+      # ------------------------------------------------------
+
+      area_rows <- bind_rows(
+
+        area_rows,
+
+        tibble(
+
+          window_start =
+            as.POSIXct(
+              t0,
+              origin = "1970-01-01",
+              tz = "UTC"
+            ),
+
+          n_window_fixes =
+            n_window,
+
+          low =
+            area_row$low,
+
+          est =
+            area_row$est,
+
+          high =
+            area_row$high
+
+        )
+
+      )
+
+    }
+
+
+    # --------------------------------------------------------
+    # Add group identifier
+    # --------------------------------------------------------
+
+    area_rows <- area_rows %>%
+
+      mutate(
+        akde_group =
+          group_name
+      ) %>%
+
+      select(
+
+        akde_group,
+
+        window_start,
+
+        n_window_fixes,
+
+        low,
+
+        est,
+
+        high
+
+      )
+
+
+    # --------------------------------------------------------
+    # Status
+    # --------------------------------------------------------
+
+    status_text <- case_when(
+
+      nrow(area_rows) > 0 ~
+        "processed",
+
+      n_eligible_windows == 0 ~
+        "no windows with >=20 fixes",
+
+      TRUE ~
+        "eligible windows but no successful AKDE"
+
+    )
+
+
+    status <- tibble(
+
+      akde_group =
+        group_name,
+
+      status =
+        status_text,
+
+      n_fixes =
+        n_fixes,
+
+      candidate_windows =
+        length(
+          starts
+        ),
+
+      eligible_20fix_windows =
+        n_eligible_windows,
+
+      successful_windows =
+        nrow(
+          area_rows
+        )
+
+    )
+
+
+    list(
+
+      area =
+        area_rows,
+
+      uds =
+        ud_list,
+
+      status =
+        status
+
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # Parallel processing
+  # ----------------------------------------------------------
+
+  results <- future_map(
+
+    names(
+      tel_list
+    ),
+
+    process_one_group,
+
+    .progress =
+      TRUE,
+
+    .options =
+      furrr_options(
+        seed = TRUE
+      )
+
+  )
+
+
+  names(results) <-
+    names(
+      tel_list
+    )
+
+
+  # ----------------------------------------------------------
+  # Extract outputs
+  # ----------------------------------------------------------
+
+  area_df <-
+    map_dfr(
+      results,
+      "area"
+    )
+
+
+  status_df <-
+    map_dfr(
+      results,
+      "status"
+    )
+
+
+  ud_lists <-
+    map(
+      results,
+      "uds"
+    )
+
+
+  # ----------------------------------------------------------
+  # Add ID / phase / resident classification
+  # ----------------------------------------------------------
+
+  area_df <- area_df %>%
+
+    left_join(
+      metadata,
+      by = "akde_group"
+    ) %>%
+
+    arrange(
+      id,
+      phase_label,
+      window_start
+    )
+
+
+  status_df <- status_df %>%
+
+    left_join(
+      metadata,
+      by = "akde_group"
+    ) %>%
+
+    arrange(
+      id,
+      phase_label
+    )
+
+
+  # ----------------------------------------------------------
+  # Report
+  # ----------------------------------------------------------
+
+  cat(
+    "\nStatus count<LOCAL_PATH>"
+  )
+
+
+  print(
+
+    status_df %>%
+
+      count(
+        status,
+        sort = TRUE
+      ),
+
+    n = Inf
+  )
+
+
+  cat(
+    "\nAKDE area rows: ",
+    nrow(area_df),
+    "\n",
+    sep = ""
+  )
+
+
+  # ----------------------------------------------------------
+  # Return everything
+  # ----------------------------------------------------------
+
+  list(
+
+    area =
+      area_df,
+
+    status =
+      status_df,
+
+    uds =
+      ud_lists,
+
+    telemetry =
+      tel_input,
+
+    metadata =
+      metadata
+
+  )
+}
+
+
+# ============================================================
+# 17. START PARALLEL PLAN
+# ============================================================
+
+plan(
+  multisession,
+  workers = N_WORKERS
+)
+
+
+options(
+  future.rng.onMisuse =
+    "ignore"
+)
+
+
+cat(
+  "\nUsing ",
+  N_WORKERS,
+  " parallel workers.\n",
+  sep = ""
+)
+
+
+# ============================================================
+# 18. RUN ALL FOUR DATASETS
+# ============================================================
+
+wtd_train_result <- run_akde_dataset(
+
+  wtd_train_akde,
+
+  "WTD CWD- TRAINING"
+
+)
+
+
+wtd_test_result <- run_akde_dataset(
+
+  wtd_test_akde,
+
+  "WTD CWD+ TESTING"
+
+)
+
+
+mule_train_result <- run_akde_dataset(
+
+  mule_train_akde,
+
+  "MULE DEER CWD- TRAINING"
+
+)
+
+
+mule_test_result <- run_akde_dataset(
+
+  mule_test_akde,
+
+  "MULE DEER CWD+ TESTING"
+
+)
+
+
+# ============================================================
+# 19. COMBINE AKDE AREA RESULTS
+# ============================================================
+
+akde_area_all <- bind_rows(
+
+  wtd_train_result$area,
+
+  wtd_test_result$area,
+
+  mule_train_result$area,
+
+  mule_test_result$area
+
+)
+
+
+# ============================================================
+# 20. COMBINE STATUS RESULTS
+# ============================================================
+
+akde_status_all <- bind_rows(
+
+  wtd_train_result$status,
+
+  wtd_test_result$status,
+
+  mule_train_result$status,
+
+  mule_test_result$status
+
+)
+
+
+# ============================================================
+# 21. OVERALL STATUS SUMMARY
+# ============================================================
+
+akde_status_summary <- akde_status_all %>%
+
+  count(
+
+    species,
+
+    cwd_group,
+
+    dataset,
+
+    akde_class,
+
+    status,
+
+    name =
+      "n_groups"
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "FINAL AKDE STATUS SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  akde_status_summary,
+  n = Inf
+)
+
+
+# ============================================================
+# 22. WINDOW FIX-COUNT DIAGNOSTIC
+#
+# Particularly important now because regularization gives
+# only 2-3 GPS fixes/day.
+# ============================================================
+
+window_fix_summary <- akde_area_all %>%
+
+  group_by(
+
+    species,
+
+    cwd_group,
+
+    dataset,
+
+    akde_class
+
+  ) %>%
+
+  summarise(
+
+    n_successful_windows =
+      n(),
+
+    min_window_fixes =
+      min(
+        n_window_fixes,
+        na.rm = TRUE
+      ),
+
+    median_window_fixes =
+      median(
+        n_window_fixes,
+        na.rm = TRUE
+      ),
+
+    mean_window_fixes =
+      mean(
+        n_window_fixes,
+        na.rm = TRUE
+      ),
+
+    max_window_fixes =
+      max(
+        n_window_fixes,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "SUCCESSFUL WINDOW FIX COUNTS\n",
+  "====================================\n"
+)
+
+
+print(
+  window_fix_summary,
+  n = Inf
+)
+
+
+# ============================================================
+# 23. AKDE AREA SUMMARY
+#
+# IMPORTANT:
+# low / est / high are left in exactly the same measurement
+# returned by ctmm as in the previous pipeline.
+# ============================================================
+
+akde_area_summary <- akde_area_all %>%
+
+  group_by(
+
+    species,
+
+    cwd_group,
+
+    dataset,
+
+    akde_class
+
+  ) %>%
+
+  summarise(
+
+    n_windows =
+      n(),
+
+    median_low =
+      median(
+        low,
+        na.rm = TRUE
+      ),
+
+    median_est =
+      median(
+        est,
+        na.rm = TRUE
+      ),
+
+    median_high =
+      median(
+        high,
+        na.rm = TRUE
+      ),
+
+    mean_est =
+      mean(
+        est,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "AKDE AREA SUMMARY\n",
+  "====================================\n"
+)
+
+
+print(
+  akde_area_summary,
+  n = Inf
+)
+
+
+# ============================================================
+# 24. FAILED / MISSING GROUPS
+# ============================================================
+
+failed_akde_groups <- akde_status_all %>%
+
+  filter(
+    status !=
+      "processed"
+  ) %>%
+
+  arrange(
+
+    species,
+
+    cwd_group,
+
+    id,
+
+    phase_label
+
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "FAILED / MISSING AKDE GROUPS\n",
+  "====================================\n"
+)
+
+
+print(
+  failed_akde_groups,
+  n = Inf
+)
+
+
+# ============================================================
+# 25. SAVE MAIN CSV OUTPUTS
+# ============================================================
+
+write_csv(
+
+  phase_classification,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "phase_classification.csv"
+  )
+
+)
+
+
+write_csv(
+
+  phase_problems,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "phase_groups_needing_review.csv"
+  )
+
+)
+
+
+write_csv(
+
+  akde_area_all,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "cross_species_AKDE_7day_windows.csv"
+  )
+
+)
+
+
+write_csv(
+
+  akde_status_all,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "cross_species_AKDE_status.csv"
+  )
+
+)
+
+
+write_csv(
+
+  akde_status_summary,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "cross_species_AKDE_status_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  failed_akde_groups,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "cross_species_AKDE_failed_groups.csv"
+  )
+
+)
+
+
+write_csv(
+
+  window_fix_summary,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "cross_species_AKDE_window_fix_summary.csv"
+  )
+
+)
+
+
+write_csv(
+
+  akde_area_summary,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "cross_species_AKDE_area_summary.csv"
+  )
+
+)
+
+
+# ============================================================
+# 26. SAVE TELEMETRY INPUTS
+#
+# Useful for reproducibility / checking exactly what went
+# into ctmm.
+# ============================================================
+
+write_csv(
+
+  wtd_train_result$telemetry,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "WTD_CWD_negative_AKDE_telemetry_input.csv"
+  )
+
+)
+
+
+write_csv(
+
+  wtd_test_result$telemetry,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "WTD_CWD_positive_AKDE_telemetry_input.csv"
+  )
+
+)
+
+
+write_csv(
+
+  mule_train_result$telemetry,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "MuleDeer_CWD_negative_AKDE_telemetry_input.csv"
+  )
+
+)
+
+
+write_csv(
+
+  mule_test_result$telemetry,
+
+  file.path(
+    AKDE_OUT_DIR,
+    "MuleDeer_CWD_positive_AKDE_telemetry_input.csv"
+  )
+
+)
+
+
+# ============================================================
+# 27. SAVE UD LISTS
+# ============================================================
+
+save_ud_lists <- function(
+    ud_lists,
+    dataset_prefix
+) {
+
+  out_dir <- file.path(
+
+    AKDE_OUT_DIR,
+
+    paste0(
+      dataset_prefix,
+      "_UD_lists"
+    )
+
+  )
+
+
+  dir.create(
+
+    out_dir,
+
+    recursive = TRUE,
+
+    showWarnings = FALSE
+
+  )
+
+
+  for (
+    nm in names(
+      ud_lists
+    )
+  ) {
+
+    this_ud <- ud_lists[[nm]]
+
+
+    if (
+      length(
+        this_ud
+      ) ==
+        0
+    ) {
+
+      next
+    }
+
+
+    safe_nm <-
+      nm %>%
+
+      str_replace_all(
+        "[^A-Za-z0-9_]+",
+        "_"
+      )
+
+
+    saveRDS(
+
+      this_ud,
+
+      file.path(
+
+        out_dir,
+
+        paste0(
+          safe_nm,
+          "_UD_list.rds"
+        )
+
+      ),
+
+      compress =
+        "gzip"
+
+    )
+  }
+}
+
+
+save_ud_lists(
+  wtd_train_result$uds,
+  "WTD_CWD_negative"
+)
+
+save_ud_lists(
+  wtd_test_result$uds,
+  "WTD_CWD_positive"
+)
+
+save_ud_lists(
+  mule_train_result$uds,
+  "MuleDeer_CWD_negative"
+)
+
+save_ud_lists(
+  mule_test_result$uds,
+  "MuleDeer_CWD_positive"
+)
+
+
+# ============================================================
+# 28. FINAL SANITY CHECK:
+# RESIDENTS SHOULD BE PHASE 1 ONLY
+# ============================================================
+
+resident_phase_check <- phase_classification %>%
+
+  filter(
+    akde_class ==
+      "resident"
+  ) %>%
+
+  filter(
+    n_phases != 1 |
+      phase_list !=
+        "Phase_1"
+  )
+
+
+cat(
+  "\n\n====================================\n",
+  "RESIDENT PHASE CHECK\n",
+  "====================================\n"
+)
+
+
+if (
+  nrow(
+    resident_phase_check
+  ) ==
+    0
+) {
+
+  cat(
+    "PASS: Every resident ID contains only Phase_1.\n"
+  )
+
+} else {
+
+  cat(
+    "WARNING: Unexpected resident phase structures found.\n"
+  )
+
+  print(
+    resident_phase_check,
+    n = Inf
+  )
+}
+
+
+# ============================================================
+# 29. FINAL MESSAGE
+# ============================================================
+
+cat(
+  "\n\n====================================\n",
+  "CROSS-SPECIES AKDE COMPLETE\n",
+  "====================================\n"
+)
+
+
+cat(
+  "\nAKDE setting<LOCAL_PATH>",
+  "- Window duration: ",
+  WINDOW_DAYS,
+  " days\n",
+  "- Minimum total fixes/group: ",
+  MIN_TOTAL_FIXES,
+  "\n",
+  "- Minimum fixes/window: ",
+  MIN_WINDOW_FIXES,
+  "\n",
+  "- Resident = Phase_1 only\n",
+  "- Multi-phase IDs calculated separately by ID + phase\n",
+  "- No AKDE area-unit conversion performed\n",
+  sep = ""
+)
+
+
+cat(
+  "\nOutputs saved t<LOCAL_PATH>",
+  AKDE_OUT_DIR,
+  "\n"
+)
+
+
+cat(
+  "\nReview these objects firs<LOCAL_PATH>",
+  "1. phase_classification\n",
+  "2. phase_problems\n",
+  "3. akde_status_summary\n",
+  "4. failed_akde_groups\n",
+  "5. window_fix_summary\n",
+  "6. akde_area_summary\n\n"
+)
+
+
+# Return to normal processing after parallel work
+plan(
+  sequential
+)
+
+```
+
+### AKDE Merge
+```{r}
+# ============================================================
+# MERGE RECALCULATED AKDE BACK ONTO REGULARIZED GPS DATA
+# 
+# IMPORTANT:
+# This script DOES NOT calculate movement metrics
+#
+# It only does the following:
+#
+#   1. Uses the four regularized GPS datasets
+#   2. Uses the completed AKDE result
+#   3. Reconstructs resident vs multi-phase AKDE groups
+#   4. Matches each AKDE estimate to it exact window_start
+#   5. Saves AKDE-enriched GPS datasets
+#
+# Movement metrics will be recalcuated AFTER this step
+#
+# ============================================================
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(lubridate)
+library(tibble)
+
+# ============================================================
+# 2. REQUIRED OBJECTS
+# ============================================================
+#
+# Regularized GPS:
+#
+#   wtd_train_reg
+#   wtd_test_reg
+#   mule_train_reg
+#   mule_test_reg
+#
+# AKDE results rom the script currently running at home:
+#
+#   wtd_train_result
+#   wtd_test_result
+#   mule_train_result
+#   mule_test_result
+#
+# ALSO:
+#
+#   phase_classification
+# ============================================================
+
+requierd_objects <- c(
+  "wtd_train_reg",
+  "wtd_test_reg",
+  "mule_train_reg",
+  "mule_test_reg",
+  "wtd_train_result",
+  "wtd_test_result",
+  "mule_train_result",
+  "mule_test_result",
+  "phase_classification"
+)
+
+missing_objects <- required_objects[
+  !vapply(
+    required_objects,
+    exists,
+    logical(1),
+    inherits = TRUE
+  )
+]
+
+if (length(missing_objects) > 0) {
+  stop(
+    paste0(
+      "\nMissing required object<LOCAL_PATH>",
+      paste(
+        missing_objects,
+        collapse = "\n"
+      ),
+      "\n\nFinish the AKDE pipeline first."
+    )
+  )
+}
+
+# ============================================================
+# 3. OUTPUT DIRECTORY
+# ============================================================
+
+BASE_DIR <-
+  "UDPATE_WITH_DESKTOP_AT_HOME"
+
+
+AKDE_MERGED_DIR <- file.path(
+  BASE_DIR,
+  "regularized_cross_species",
+  "AKDE_merged"
+)
+
+dir.create(
+  AKDE_MERGED_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# ============================================================
+# 4. CLEAN PHASE LABELS
+#
+# Must use exactly the same convention as the AKDE pipeline
+#
+# Example:
+#   Phase 1
+#   Phase_1
+#   phase 1
+#
+# all become:
+#
+#   Phase_1
+# ============================================================
+
+clean_phase <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- str_squish(x)
+  x <- str_replace_all(
+    x,
+    "-",
+    " "
+  )
+  
+  x_lower <- str_to_lower(x)
+  x_lower[
+    x_lower %in%
+      c(
+        "",
+        "na",
+        "remove"
+      )
+  ] <- NA_character_
+  
+  phase_num <- str_extract(
+    x_lower,
+    "\\d+"
+  )
+  
+  result <- ifelse(
+    !is.na(
+      phase_num
+    ),
+    paste0(
+      "Phase_",
+      phase_num
+    ),
+    ifelse(
+      is.na(
+        x_lower
+      ),
+      str_replace_all(
+        str_to_title(x),
+        "\\s+",
+        "-"
+      )
+    )
+  )
+  result
+}
+
+# ============================================================
+# 5. COMBINE THE FOUR AKDE AREA TABLES
+# ============================================================
+
+akde_area_all <- bind_rows(
+  wtd_train_result$area,
+  wtd_test_result$area,
+  mule_train_result$area,
+  mule_test_result$area
+)
+
+cat(
+  "\n\n============================================================\n",
+  "COMBINED AKDE AREA\n",
+  "============================================================\n"
+)
+
+cat(
+  "Total successful AKDE windows: ",
+  nrow(akde_area_all),
+  "\n",
+  sep =""
+)
+
+# ============================================================
+# 6. STANDARDIZE AKDE OUTPUT COLUMNS
+#
+# We rename low / est / high now so they cannot be confused
+# with any older AKDE columns already present in the datasets
+# ============================================================
+
+akde_merge_table <- akde_area_all %>%
+  mutate(
+    id =
+      as.character(
+        id
+      ),
+    akde_window_start =
+      as.POSIXct(
+        window_start,
+        tz = "UTC"
+      ),
+    akde_window_end =
+      adke_window_start +
+      days(7)
+  ) %>%
+  rename(
+    akde_low = 
+      low,
+    akde_est = 
+      est,
+    akde_high =
+      high
+  ) %>%
+  select(
+    species,
+    cwd_group,
+    dataset,
+    id,
+    phase_label,
+    akde_class,
+    akde_group,
+    akde_window_start,
+    akde_window_end,
+    n_window_fixes,
+    akde_low,
+    akde_est,
+    akde_high
+  )
+
+# ============================================================
+# 7. CHECK FOR DUPLICATES AKDE KEYS
+# 
+# There should be ONE AKDE estimate per:
+#     akde_group + window_start
+#
+# ============================================================
+
+duplicate_akde_windows <- akde_merge_table %>%
+  count(
+    species,
+    cwd_group,
+    dataset,
+    akde_group,
+    akde_window_start,
+    name =
+      "n"
+  ) %>%
+  filter(
+    n > 1
+  )
+cat(
+  "\n\n============================================================\n",
+  "DUPLICATE AKDE WINDOW CHECH\n",
+  "============================================================"
+)
+
+if (
+  nrow(
+    duplicate_akde_windows
+  ) ==
+  0
+) {
+  cat(
+    "PASS: No duplicate AKDE windows.\n"
+  )
+} else {
+  cat(
+    "WARNING: Duplicate AKDE windows found.\n"
+  )
+  
+  print(
+    duplicate_akde_windows,
+    n = Inf
+  )
+}
+
+# ============================================================
+# 8. PREPARE PHASE CLASSIFICATION LOOKUP
+#
+# Resident:
+#
+#   only Phase_1
+#
+# Multi-phase:
+#   more than one phase
+#
+# ============================================================
+
+phase_lookup <- phase_classification %>%
+  select(
+    species,
+    cwd_group,
+    dataset,
+    id,
+    n_phases,
+    phase_list,
+    akde_class
+  ) %>%
+  mutate(
+    id =
+      as.character(
+        id
+      )
+  ) %>%
+  distinct()
+
+# ============================================================
+# 9. PREPARE REGULARIZED DATASET 
+# ============================================================
+
+prepare_regularized_for_akde <- function(
+    data,
+    dataset_name
+) {
+  cat(
+    "\n\n============================================================\n",
+    "PREPARING: ",
+    dataset_name,
+    "\n",
+    "===========================================================\n",
+    sep = ""
+  )
+  
+  data <- data %>%
+    mutate(
+      id =
+        as.character(
+          id
+        ),
+      .datetime = 
+        as.POSIXct(
+          .datetime,
+          tz = "UTC"
+        )
+    )
+  # --------------------------------------------------------
+  # Ensure phases exists
+  # --------------------------------------------------------
+  
+  if (
+    !"phases" %in%
+      names(
+        data
+      )
+  ) {
+    stop(
+      paste0(
+        dataset_name,
+        " does not contain 'phases' column."
+      )
+    )
+  }
+  # --------------------------------------------------------
+  # Standardize phase
+  # --------------------------------------------------------
+  data <- data %>%
+    mutate(
+      phase_label_current =
+        clean_phase(
+          phases
+        )
+    )
+  # --------------------------------------------------------
+  # Remove old classification columns if present
+  # --------------------------------------------------------
+  
+  data <- data %>%
+    select(
+      -any_of(
+        c(
+          "n_phases",
+          "phase_list",
+          "akde_class",
+          "akde_group"
+        )
+      )
+    )
+  # --------------------------------------------------------
+  # Add phase classification
+  # --------------------------------------------------------
+  
+  data <- data %>%
+    left_join(
+      phase_lookup,
+      by = c(
+        "species",
+        "cwd_group",
+        "dataset",
+        "id"
+      )
+    )
+  # --------------------------------------------------------
+  # Construct same group identifier used by AKDE
+  # 
+  # Resident:
+  #   ID
+  # Multi-phase:
+  #   ID_Phase
+  # --------------------------------------------------------
+  
+  data <- data %>%
+    mutate(
+      akde_group = case_when(
+        akde_class ==
+          "resident" ~
+          id,
+        akde_class ==
+          "multi_phase" &
+          !is.na(
+            phase_label_current
+          ) ~ 
+          paste(
+            id,
+            phase_label_current
+          ) ~ 
+          paste(
+            id,
+            phase_label_current,
+            sep = "_"
+          ),
+        TRUE ~
+          NA_character_
+      )
+    )
+  # ---------------------------------------------------------
+  # Diagnostics
+  # ---------------------------------------------------------
+  cat(
+    "Rows: ",
+    nrow(data),
+    "\n",
+    sep = ""
+  )
+  
+  cat(
+    "Animals: ",
+    n_distinct(
+      data$id
+    ),
+    "\n",
+    sep = ""
+  )
+  
+  cat(
+    "Rows with AKDE group: ",
+    sum(
+      !is.na(
+        data$akde_group
+      )
+    ),
+    "\n",
+    sep = ""
+  )
+  
+  cat(
+    "Rows missing AKDE group: ",
+    sum(
+      is.na(
+        data$akde_group
+      )
+    ),
+    "\n",
+    sep = ""
+  )
+  data
+}
+
+# ============================================================
+# 10. PREPARE ALL FOUR DATASETS
+# ============================================================
+
+wtd_train_premerge <- prepare_regularized_for_akde(
+  wtd_train_reg,
+  "WTD CWD- TRAINING"
+)
+
+wtd_test_premerge <- prepare_regularized_for_akde(
+  wtd_test_reg,
+  "WTD CWD+ Testing"
+)
+
+mule_train_premerge <- prepare_regularized_for_akde(
+  mule_train_reg,
+  "MULE CWD- TRAINING"
+)
+
+mule_test_premerge <- prepare_regularized_for_akde(
+  mule_test_reg,
+  "MULE CWD+ TESTING"
+)
+
+# ============================================================
+# 11. REMOVE OLD AKDE COLUMNS
+#
+# Original source CSVs already contained previous AKDE
+# variables. Don't want those accidentally entering the
+# new cross-species analysis
+#
+# Only remove old AKDE feature names if present
+# ============================================================
+
+remove_old_akde <- function(data) {
+  old_akde_columns <- c(
+    "akde_low",
+    "akde_est",
+    "akde_high",
+    "AKDE_low",
+    "AKDE_est",
+    "AKDE_high",
+    "akde_lci",
+    "akde_uci",
+    "AKDE_LCI",
+    "AKDE_UCI",
+    "space_use-Low",
+    "space_use_est",
+    "space_use_high",
+    "akde_window_start",
+    "akde_window_end",
+    "n_window_fixes"
+  )
+  data %>%
+    select(
+      -any_of(
+        old_akde_columns
+      )
+    )
+}
+
+wtd_train_premerge <-
+  remove_old_akde(
+    wtd_train_premerge
+  )
+
+wtd_test_premerge <-
+  remove_old_akde(
+    wtd_test_premerge
+  )
+mule_train_premerge <- 
+  remove_old_akde(
+    mule_train_premerge
+  )
+mule_test_premerge <-
+  remove_old_akde(
+    mule_test_premerge
+  )
+
+# ============================================================
+# 12. AKDE MERGE FUNCTION
+#
+# IMPORTANT:
+#
+# The AKDE window starts on an actual telemetry observation.
+#
+# Therefore we match:
+#
+#   GPS .datetime
+#
+# exacatly to:
+#
+#   AKDE window_start
+#
+# within the same AKDE group.
+#
+# We DO NOT carry AKDE values forward
+# We DO NOT interpolate AKDE
+# We DO NOT average overlapping AKDE widows
+# ============================================================
+
+merge_akde_exact <- function(
+    gps_data,
+    akde_data,
+    dataset_name
+) {
+  cat(
+    "\n\n============================================================\n",
+    "MERGING AKDE: ",
+    dataset_name,
+    "\n",
+    "============================================================\n",
+    sep = ""
+  )
+  
+  # ----------------------------------------------------------
+  # Determine dataset identify
+  # ----------------------------------------------------------
+  
+  species_value <- 
+    unique(
+      gps_data$species
+    )
+  cwd_value <-
+    unique(
+      gps_data$cwd_group
+    )
+  data_value <-
+    unique(
+      gps_data$dataset
+    )
+  if(
+    length(
+      species_value
+    ) !=
+      1 ||
+    length(
+      cwd_value
+    ) !=
+      1 ||
+    length(
+      cwd_value
+    ) !=
+      1 ||
+    length(
+      dataset_value
+    ) !=
+      1
+  ) {
+    stop(
+      paste0(
+        dataset_name,
+        ": expected one species/CWD/dataset combination."
+      )
+    )
+  }
+  # -------------------------------------------------------
+  # Restrict AKDE to this dataset
+  # -------------------------------------------------------
+  this_akde <- akde_data %>%
+    filter(
+      species ==
+        species_value,
+      cwd_group ==
+        cwd_value,
+      dataset ==
+        dataset_value
+    ) %>%
+    select(
+      akde_group,
+      akde_window_start,
+      akde_window_end,
+      n_window_fixes,
+      akde_low,
+      akde_est,
+      akde_high
+    )
+  # --------------------------------------------------------
+  # Exact join
+  # --------------------------------------------------------
+  result <- gps_data %>%
+    left_join(
+      this_akde,
+      by = join_by(
+        akde_group,
+        .datetime ==
+          akde_window_start
+      )
+    ) %>%
+    arrange(
+      id,
+      .datetime
+    )
+  # -------------------------------------------------------
+  # Diagnostics
+  # -------------------------------------------------------
+  matched_rows <-
+    sum(
+      !is.na(
+        result$akde_est
+      )
+    )
+  cat(
+    "GPS rows: ",
+    nrow(result),
+    "\n",
+    sep = ""
+  )
+  cat(
+    "Rows with new AKDE: ",
+    matched_rows,
+    "\n",
+    sep = ""
+  )
+  cat(
+    "Percent with AKDE: ",
+    round(
+      100 *
+        matched_rows /
+        nrow(result),
+      2
+    ),
+    "%\n",
+    sep = ""
+  )
+  cat(
+    "Animal with >=1 new AKDE: ",
+    result %>%
+      filter(
+        !is.na(
+          akde_est
+        )
+      ) %>%
+      summarise(
+        n =
+          n_distinct(
+            id
+          )
+      ) %>%
+      pull(
+        n
+      ),
+    "\n",
+    sep = ""
+  )
+  result
+}
+
+# ============================================================
+# 13. MERGE AKDE INTO ALL FOUR REGULARIZED DATASET
+# ============================================================
+
+wtd_train_akde_merged <- merge_akde_exact(
+  wtd_train_premerge,
+  akde_merge_table,
+  "WTD CWD- TRAINING"
+)
+
+wtd_test_akde_merged <- merge_akde_exact(
+  wtd_test_premerge,
+  akde_merge_table,
+  "WTD CWD+ TESTING"
+)
+
+mule_train_akde_merged <- merge_akde_exact(
+  mule_train_premerge,
+  akde_merge_table,
+  "MULE CWD- TRAINING"
+)
+
+mule_test_akde_merged <- merge_akde_exact(
+  mule_test_premerge,
+  akde_merge_table,
+  "MULE CWD+ TESTING"
+)
+
+# ============================================================
+# 14. DATASET-LEVEL MATCH SUMMARY
+# ============================================================
+
+summarize_akde_merge <- function(
+    data,
+    dataset_name
+) {
+  animal_total <-
+    n_distinct(
+      data$id
+    )
+  animals_with_akde <-
+    data %>%
+    filter(
+      !is.na(
+        akde_est
+      )
+    ) %>%
+    summarise(
+      n =
+        n_distinct(
+          id
+        )
+    ) %>%
+    pull(
+      n
+    )
+  tibble(
+    dataset = 
+      dataset_name,
+    n_animals =
+      animals_total,
+    animals_with_akde =
+      animals_with_akde,
+    animals_without_akde =
+      animals_total -
+      animals_with_akde,
+    n_rows =
+      nrow(
+        data
+      ),
+    rows_with_akde =
+      sum(
+        !is.na(
+          data$akde_est
+        )
+      ),
+    percent_rows_wih_akde =
+      round(
+        100 *
+          mean(
+            !is.na(
+              data$akde_est
+            )
+          ),
+        2
+      )
+  )
+}
+
+akde_merge_summary <- bind_rows(
+  summarize_akde_merge(
+    wtd_train_akde_merged,
+    "WTD CWD-"
+  ),
+  summarize_akde_merge(
+    wtd_test_akde_merged,
+    "WTD CWD+"
+  ),
+  summarize_akde_merge(
+    mule_train_akde_merged,
+    "Mule CWD-"
+  ),
+  summarize_akde_merge(
+    mule_test_akde_merged,
+    "Mule CWD+"
+  )
+)
+
+cat(
+  "\n\n============================================================\n",
+  "AKDE MERGE SUMMARY\n",
+  "============================================================\n"
+)
+
+print(
+  akde_merge_summary
+)
+
+
+# ============================================================
+# 15. FIND ANIMALS WITH NO SUCCESSFUL AKDE
+# ============================================================
+
+find_animals_without_akde <- function(
+    data,
+    dataset_name
+) {
+  all_ids <- data %>%
+    distinct(
+      id
+    )
+  akde_ids <- data %>%
+    filter(
+      !is.na(
+        akde_est
+      )
+    ) %>%
+    distinct(
+      id
+    )
+  anti_join(
+    all_ids,
+    akde_ids,
+    by =
+      "id"
+  ) %>%
+    mutate(
+      dataset =
+        dataset_name
+    ) %>%
+    select(
+      dataset,
+      id
+    )
+}
+
+
+animals_without_akde <- bind_rows(
+  find_animals_without_akde(
+    wtd_train_akde_merged,
+    "WTD CWD-"
+  ),
+  find_animals_without_akde(
+    wtd_test_akde_merged,
+    "WTD CWD+"
+  ),
+  find_animals_without_akde(
+    mule_train_akde_merged,
+    "Mule CWD-"
+  ),
+  find_animals_without_akde(
+    mule_test_akde_merged,
+    "Mule CWD+"
+  )
+)
+
+cat(
+  "\n\n============================================================\n",
+  "ANIMALS WITHOUR ANY AKDE\n",
+  "============================================================\n"
+)
+
+print(
+  animals_without_akde,
+  n = Inf
+)
+
+# ============================================================
+# 16. CHECK AKDE VALUES
+# ============================================================
+
+akde_value_summary <- bind_rows(
+  wtd_train_akde_merged %>%
+    mutate(
+      data_name =
+        "WTD CWD-"
+    ),
+  wtd_test_akde_merged %>%
+    mutate(
+      dataset_name =
+        "WTD CWD+"
+    ),
+  mule_train_akde_merged %>%
+    mutate(
+      dataset_name =
+        "Mule CWD-"
+    ),
+  mule_test_akde_merged %>%
+    mutate(
+      dataset_name =
+        "Mule CWD+"
+    )
+) %>%
+  filter(
+    !is.na(
+      akde_est
+    )
+  ) %>%
+  group_by(
+    dataset_name
+  ) %>%
+  summarise(
+    n_akde = 
+      n(),
+    median_low =
+      median(
+        akde_low,
+        na.rm = TRUE
+      ),
+    median_est =
+      median(
+        akde_est,
+        na.rm = TRUE
+      ),
+    median_high =
+      median(
+        akde_high,
+        na.rm = TRUE
+      ),
+    min_est =
+      min(
+        akde_est,
+        na.rm = TRUE
+      ),
+    max_est =
+      max(
+        akde_est,
+        na.rm = TRUE
+      ),
+    .groups =
+      "drop"
+  )
+
+cat(
+  "\n\n============================================================\n",
+  "AKDE VALUE SUMMARY",
+  "============================================================\n"
+)
+
+print(
+  akde_value_summary
+)
+
+
+# ============================================================
+# 17. SAVE FULL AKDE-MERGED GPS DATA
+#
+# IMPORTANT:
+#
+# KEEP ALL GPS ROWS
+#
+# Rows without AKDE remain NA.
+#
+# Do NOT remove them yet because movement features have not
+# been calculated yet.
+# ============================================================
+write_csv(
+  wtd_train_akde_merged,
+  file.path(
+    AKDE_MERGED_DIR,
+    "WTD_CWD_negative_regularized_AKDE_merged.csv"
+  )
+)
+
+write_csv(
+  wtd_test_akde_merged,
+  file.path(
+    AKDE_MERGED_DIR,
+    "WTD_CWD_positive_regularized_AKDE_merged.csv"
+  )
+)
+
+write_csv(
+  mule_train_akde_merged,
+  file.path(
+    AKDE_MERGED_DIR,
+    "Mule_Deer_CWD_negative_regularized_AKDE_merged.csv"
+  )
+)
+
+write_csv(
+  mule_testing_akde_merged,
+  file.path(
+    AKDE_MERGED_DIR,
+    "Mule_Deer_CWD_positive_regularized_AKDE_merged.csv"
+  )
+)
+
+# ============================================================
+# 18. SAVE DIAGNOSTICS
+# ============================================================
+
+write_csv(
+  akde_merge_summary,
+  file.path(
+    AKDE_MERGED_DIR,
+    "AKDE_merge_summary.csv"
+  )
+)
+
+write_csv(
+  animals_without_akde,
+  file.path(
+    AKDE_MERGED_DIR,
+    "animals_without_AKDE.csv"
+  )
+)
+
+write_csv(
+  akde_value_summary,
+  file.path(
+    AKDE_MERGED_DIR,
+    "AKDE_value_summary.csv"
+  )
+)
+
+write_csv(
+  duplicate_akde_windows,
+  file.path(
+    AKDE_MERGED_DIR,
+    "duplicate_AKDE_windows.csv"
+  )
+)
+
+# ============================================================
+# 19. FINAL MESSAGE
+# ============================================================
+
+
+cat(
+  "\n\n============================================================",
+  "AKDE MERGE COMPLETE",
+  "============================================================\n"
+)
+
+
+```

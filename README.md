@@ -51,8 +51,20 @@ the reproducible engineering and analysis patterns behind the work.
 
 ## Actual Manuscript Scripts
 
-The manuscript-profile scripts are the closest public-safe representation of the paper
-workflow. They preserve the notebook decisions that matter for scientific review:
+The original manuscript work lives in notebooks and R Markdown files, including WTD
+autoencoder notebooks, mule deer infection/prevalence experiments, AKDE review files,
+relocation diagnostics, manual trajectory review, and genotype-transfer experiments.
+Public-safe source snapshots are preserved under
+`research_archive/original_manuscript_code/`; see `docs/original_archive_inventory.md` for
+the source-file inventory from the supplied archive.
+
+Those files are the research provenance layer. Notebook outputs were cleared, local machine
+paths were redacted, and the mule deer `60:40_Experiment` folder name was normalized to
+`60_40_Experiment` for cross-platform Git compatibility. The files are not expected to
+rerun without the protected raw telemetry and local study files.
+
+The public manuscript-profile scripts are cleaned ports of that work. They preserve the
+notebook decisions that matter for scientific review:
 
 - WTD primary profile: `velo`, `abs_rel_angle`, `sinuosity`, rolling angle/velocity
   moments, `akde_low`, `akde_est`, `akde_high`, and `season`.
@@ -170,6 +182,7 @@ docs/
   data_schema.md                      # expected public-safe input columns
   methods.md                          # modeling and validation design
   manuscript_code_mapping.md          # mapping from private notebooks to public scripts
+  original_archive_inventory.md       # inventory of supplied manuscript notebooks/Rmds
   reproducibility_checklist.md        # controls needed before claiming results
   sensitive_data_policy.md            # what must stay out of GitHub
 config/
@@ -177,7 +190,8 @@ config/
 data/sample/
   README.md
 research_archive/
-  README.md                           # notes on excluded exploratory notebooks
+  README.md                           # notes on public-safe source-code snapshots
+  original_manuscript_code/           # stripped-output source snapshots from supplied archive
 ```
 
 ## Why This Matters

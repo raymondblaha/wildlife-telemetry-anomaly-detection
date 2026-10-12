@@ -9,6 +9,12 @@ The public repository should be read as a cleaned, public-safe refactor and map 
 source workflows. It is not meant to pretend that the refactored Python scripts were the
 original research notebooks.
 
+Public-safe source snapshots from this archive are preserved in
+`research_archive/original_manuscript_code/`. Notebook outputs were cleared before
+publication, local machine paths were replaced with `<LOCAL_PATH>`, and the original mule
+deer `60:40_Experiment` folder was normalized to `60_40_Experiment` for cross-platform Git
+compatibility.
+
 ## Primary Manuscript Source Files
 
 | Study area | Original file | Role in the research workflow |

@@ -1,0 +1,209 @@
+COMBINED ANOMALY-DETECTION PROJECT NOTES
+========================================
+
+Project purpose
+---------------
+This repository contains preprocessing, movement-quality review, AKDE analysis,
+and autoencoder experiments intended to identify unusual deer movement patterns.
+CWD means chronic wasting disease; CWD+ and CWD- mean infected and uninfected,
+respectively. WTD means white-tailed deer. MF means male and female combined.
+
+
+Study-design notes
+------------------
+
+Combined_MF_Infection_10
+  This is the combined male-and-female infected-animal experiment. Both the
+  training dataset and the testing dataset have 10% CWD prevalence (10% of the
+  animals are CWD+). The corresponding notebook is
+  mule_deer/60:40_Experiment/combined_MF_Infection_10_2 copy.ipynb.
+
+Combined_MF_Infection_20, _30, and _40
+  These notebooks repeat the combined-sex infection experiment at the prevalence
+  indicated by the filename. Confirm the exact animal counts in train_combined.csv
+  and test_combined.csv before reporting results, because those source data are
+  external to this repository.
+
+60:40 experiment
+  mule_deer/60:40_Experiment/60_40_Experiment.ipynb uses the prepared
+  all_train_60_40.csv and all_test_60_40.csv datasets. The training pool is
+  filtered to CWD-negative animals before its animal-level training/validation
+  split. Record in the manuscript what “60:40” represents (class composition,
+  sex composition, or another split), because the filename alone is ambiguous.
+
+100 experiment
+  mule_deer/60:40_Experiment/100_Experiment_2 copy.ipynb trains on the
+  CWD-negative (unaffected) dataset and evaluates the learned baseline on the
+  CWD-positive (affected) dataset. A grouped 80:20 training/validation split is
+  made by animal ID, helping prevent observations from the same animal from
+  appearing in both subsets.
+
+
+Genotype-transfer experiments
+-----------------------------
+The WTD genotype notebooks test whether movement patterns learned from one
+CWD-free PRNP genotype transfer to another CWD-free genotype. The genotype on
+the LEFT side of “vs” is the training/reference genotype; the genotype on the
+RIGHT side is the held-out testing/comparison genotype.
+
+Example: Genotype_CWD_Free_Vs_Free_WTD_GG_vs_SS
+  The autoencoder is trained on CWD-free GG white-tailed deer and then applied
+  to CWD-free SS white-tailed deer to evaluate whether SS animals move similarly
+  to the GG reference group. “Similarly” is operationalized by reconstruction
+  error/anomaly classification: lower errors and fewer anomalous classifications
+  indicate that the held-out genotype is represented well by movement patterns
+  learned from the training genotype. This is a transfer/similarity test, not a
+  test of infection effects or proof that the genotypes move identically.
+
+Other filename comparisons follow the same convention:
+  - GS_vs_GG: train/reference = CWD-free GS; test/comparison = CWD-free GG.
+  - GS_vs_SS: train/reference = CWD-free GS; test/comparison = CWD-free SS.
+  - SS_vs_GS: train/reference = CWD-free SS; test/comparison = CWD-free GS.
+
+Genotype codes in the WTD notebooks are intended to map as 0 = GG, 1 = GS, and
+2 = SS. Check the mapping inside each notebook before rerunning: some copied
+notebooks contain stale or contradictory inline comments even where the mapping
+dictionary is correct. The two “Genotype_CWD_Free_Vs_Free copy...” notebooks use
+a different SS/SF/FF genotype vocabulary and should not be interpreted with the
+WTD GG/GS/SS mapping.
+
+
+Methods overview
+----------------
+1. Clean GPS records and standardize identifiers, timestamps, coordinates, CWD
+   status, sex, genotype, and other metadata.
+2. Regularize fix timing before deriving movement features. Recalculate movement
+   metrics after regularization rather than carrying metrics forward from the
+   irregular observations.
+3. Engineer movement and temporal features (for example, distance/step behavior,
+   turning angle, sinuosity, rolling summaries, and seasonal indicators).
+4. Split data by animal ID, not by individual GPS row, so one animal cannot leak
+   information between model-training and validation/test partitions.
+5. Fit preprocessing objects on the training data only, then freeze and reuse the
+   same encoder, scaler, feature order, and model for validation/testing.
+6. Train the autoencoder to reconstruct the reference movement distribution.
+   Reconstruction error is the anomaly score. Freeze the anomaly threshold from
+   training/validation data before evaluating the test set.
+7. Report both row-level and animal-level performance. Document the rule used to
+   convert anomalous rows/windows into an animal-level classification.
+8. Examine feature-level reconstruction residuals to describe which movement
+   features contribute to errors. These residuals are associations and should
+   not be interpreted as causal effects of CWD or genotype.
+
+Important controls to document for reproducibility
+--------------------------------------------------
+- Experimental unit and prevalence: calculate prevalence from unique animals,
+  not GPS rows. For the 10% experiment, verify 10% CWD+ independently in both
+  training and testing after all exclusions.
+- Independence: keep each animal in only one split unless the analysis is
+  explicitly longitudinal and accounts for repeated measures.
+- Class balance: preserve the planned animal-level prevalence after filtering.
+- Sex and genotype: report their distributions by split; combined-sex analyses
+  can otherwise learn sex composition rather than infection-related movement.
+- Time: report sampling interval, date range, season coverage, and the length of
+  movement windows. Unequal monitoring duration can change anomaly opportunity.
+- Threshold: record the error statistic, percentile/decision rule, and dataset
+  used to choose it. Never tune the threshold on the final test outcomes.
+- Randomness: record seeds for splitting and model fitting.
+- Metrics: include confusion matrix counts, sensitivity/recall, specificity,
+  precision, F1, and balanced accuracy. Include uncertainty or repeated-split
+  variability where possible, especially with few animals.
+- Missing data: state coordinate/fix-quality exclusions and how missing movement
+  features were handled. Do not allow imputation to use test-set information.
+- Repeated fixes: row-level metrics are not independent animal replicates; use
+  animal-level summaries for biological inference.
+
+
+File descriptions
+-----------------
+
+cross_species/Mule_WTD_Normalization.Rmd
+  Regularizes WTD and mule-deer GPS schedules for cross-species comparison. It
+  targets 00:00/09:00/18:00 for WTD and 00:00/08:00/16:00 for mule deer, retains
+  animal-days with at least two of three target fixes, and starts a new segment
+  after a gap longer than 16 hours. Downstream movement metrics should be grouped
+  by both id and segment_id.
+
+cross_species/Genotype_CWD_Free_Vs_Free_WTD_*.ipynb
+  CWD-free WTD genotype-transfer autoencoder experiments. Interpret the ordered
+  genotype pair using the left=train, right=test convention above.
+
+cross_species/Genotype_CWD_Free_Vs_Free copy*.ipynb
+  Earlier CWD-free genotype comparison notebooks using SS/SF/FF labels. Treat
+  these as a separate genotype coding scheme from the WTD GG/GS/SS notebooks.
+
+mule_deer/60:40_Experiment/combined_MF_Infection_10_2 copy.ipynb
+  Combined male/female experiment with 10% CWD prevalence in each of the training
+  and testing datasets. Includes preprocessing, validation/cross-validation,
+  testing, performance metrics, PCA/class exploration, and residual analysis.
+
+mule_deer/60:40_Experiment/Combined_MF_Infection_20 copy.ipynb
+mule_deer/60:40_Experiment/Combined_MF_Infection_30 copy.ipynb
+mule_deer/60:40_Experiment/Combined_MF_Infection_40 copy.ipynb
+  Combined-sex conditional-autoencoder experiments at the prevalence/split level
+  named in each file. They also attach CWD and disease-stage labels and contain
+  post-analysis of reconstruction residuals and classification errors.
+
+mule_deer/60:40_Experiment/60_40_Experiment.ipynb
+  Autoencoder experiment using the prepared 60:40 train/test files, with a
+  grouped animal-level validation split from the CWD-negative training pool.
+
+mule_deer/60:40_Experiment/100_Experiment_2 copy.ipynb
+  Baseline experiment trained on CWD-free animals and tested on CWD+ animals.
+
+mule_deer/60:40_Experiment/White_Tailed_Deer_REDO3.Rmd
+  Preprocessing workflow copied into this experiment directory; reads telemetry,
+  standardizes fields and timestamps, and removes records without coordinates.
+  The filename says WTD, so verify species and input paths before reuse.
+
+mule_deer/60:40_Experiment/Visual_Inspection_Mule_Deer.Rmd
+  Manual-label review and static/interactive trajectory visualization for mule
+  deer. It currently contains machine-specific input paths.
+
+white_tailed_deer/White_Tailed_Deer_REDO3.Rmd
+  WTD telemetry preprocessing, including import, field checks, timestamp parsing,
+  coordinate cleaning, and preparation for downstream movement analysis.
+
+white_tailed_deer/White_Tailed_Deer_Manual_Review.Rmd
+  Manual review and visualization of individual WTD trajectories/labels. It was
+  created as a lower-compute alternative and contains machine-specific paths.
+
+white_tailed_deer/Relocation_Analysis.Rmd
+  GPS fix-success diagnostic to be run before trajectory regularization. It
+  summarizes fixes per deer-day, individual and seasonal/monthly differences,
+  and retention under minimum-fix criteria (including >=3 versus >=4 fixes/day).
+
+white_tailed_deer/Combo_AKDE_Results.Rmd
+  Joins migratory and resident seven-day AKDE estimates and confidence limits
+  back to their cleaned input records and writes enriched datasets.
+
+white_tailed_deer/AKDE_REVIEW.Rmd
+  Deep diagnostic of selected CWD+ and CWD- animals using original ctmm utilization
+  distributions. Reviews AKDE estimates/intervals, effective sample sizes,
+  bandwidth behavior, and whether particular migration phases drive results.
+
+white_tailed_deer/autoencoder_100.ipynb
+  Main WTD autoencoder analysis using CWD-negative training data and CWD-positive
+  testing data, with movement/AKDE follow-up analyses included in later cells.
+
+white_tailed_deer/autoencoder_100_4pings.ipynb
+  WTD sensitivity analysis using six-hour resampling (four fixes per day), with
+  frozen row- and animal-level flags and feature-contribution outputs.
+
+white_tailed_deer/WTD_Autoencoder_4hours.ipynb
+  WTD sensitivity analysis using a four-hour sampling/regularization workflow and
+  trimmed AKDE inputs; confirm the achieved daily fix count from output summaries.
+
+
+Repository-use cautions
+-----------------------
+- Many notebooks reference external F:, E:, LaCie, or SanDisk paths. Update paths
+  or parameterize a project data root before running on another machine.
+- Filenames containing “copy” or “copy 2” do not identify a definitive version.
+  Compare modification dates/results and designate one canonical notebook before
+  publication or archival.
+- Several notebooks retain exploratory interpretations and output in saved cells.
+  Rerun from a clean kernel and confirm that displayed results match current code.
+- Do not infer study design solely from folder or filename labels. Preserve a
+  split manifest listing animal ID, CWD status, sex, genotype, date range, and
+  assigned train/validation/test partition for every reported experiment.

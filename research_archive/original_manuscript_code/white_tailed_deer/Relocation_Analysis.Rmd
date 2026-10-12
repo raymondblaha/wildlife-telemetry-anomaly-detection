@@ -1,0 +1,2586 @@
+---
+title: "Relocation_Analysis"
+author: "Raymond"
+date: "2026-09-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# =============================================================================
+# GPS FIX-SUCCESS DIAGNOSTIC
+#
+# Purpose:
+#   Address reviewer/coauthor questions about:
+#     1. How many usable GPS fixes occurred per deer per day?
+#     2. What proportion of deer-days had 8, 7, 6, 5, 4, or 3 fixes?
+#     3. Did fix success differ among individual deer?
+#     4. Did fix success differ across seasons/months?
+#     5. How much does a >=3 vs >=4 fixes/day criterion affect retention?
+#
+# IMPORTANT:
+#   Run this on data BEFORE 3-hour trajectory regularization.
+# =============================================================================
+
+
+# =============================================================================
+# 1. PACKAGES
+# =============================================================================
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+
+
+# =============================================================================
+# 2. USER SETTINGS
+# =============================================================================
+
+base_dir <- "<LOCAL_PATH>"
+
+neg_file <- file.path(
+  base_dir,
+  "CWD_negative_training_with_seasons2_copy.csv"
+)
+
+
+
+pos_file <- file.path(
+  base_dir,
+  "CWD_positive_testing_with_seasons2_copy.csv"
+)
+
+output_dir <- file.path(
+  base_dir,
+  "GPS_fix_success_diagnostic"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+EXPECTED_FIXES_PER_DAY <- 8
+MIN_DAYS <- 20
+
+
+# =============================================================================
+# 3. HELPER: FIND COLUMN NAME
+# =============================================================================
+
+find_column <- function(data, candidates, required = TRUE) {
+
+  found <- candidates[candidates %in% names(data)]
+
+  if (length(found) > 0) {
+
+    return(found[1])
+
+  }
+
+  if (required) {
+
+    stop(
+      paste0(
+        "Could not find any of these columns: ",
+        paste(candidates, collapse = ", ")
+      )
+    )
+
+  }
+
+  return(NA_character_)
+}
+
+
+# =============================================================================
+# 4. LOAD DATA
+# =============================================================================
+
+cwd_neg <- read_csv(
+  neg_file,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    cwd_group = "CWD-"
+  )
+
+cwd_pos <- read_csv(
+  pos_file,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    cwd_group = "CWD+"
+  )
+
+all_data <- bind_rows(
+  cwd_neg,
+  cwd_pos
+)
+
+cat("\n============================================================\n")
+cat("DATA LOADED\n")
+cat("============================================================\n")
+
+cat("\nTotal rows:", nrow(all_data), "\n")
+cat("Unique column<LOCAL_PATH>")
+print(names(all_data))
+
+
+# =============================================================================
+# 5. IDENTIFY IMPORTANT COLUMNS
+# =============================================================================
+
+id_col <- find_column(
+  all_data,
+  c(
+    "id",
+    "ID",
+    "deer_id",
+    "animal_id"
+  )
+)
+
+datetime_col <- find_column(
+  all_data,
+  c(
+    "datetime",
+    "date_time",
+    "DateTime",
+    "timestamp",
+    "Timestamp",
+    "date"
+  )
+)
+
+dop_col <- find_column(
+  all_data,
+  c(
+    "dop",
+    "DOP",
+    "dilution_of_precision",
+    "DilutionOfPrecision"
+  ),
+  required = FALSE
+)
+
+season_col <- find_column(
+  all_data,
+  c(
+    "season",
+    "Season"
+  ),
+  required = FALSE
+)
+
+
+cat("\nDetected ID column:", id_col, "\n")
+cat("Detected datetime column:", datetime_col, "\n")
+
+if (!is.na(dop_col)) {
+
+  cat("Detected DOP column:", dop_col, "\n")
+
+} else {
+
+  cat(
+    "WARNING: No DOP column detected.\n",
+    "The script cannot independently repeat the DOP <= 10 filter.\n"
+  )
+
+}
+
+if (!is.na(season_col)) {
+
+  cat("Detected season column:", season_col, "\n")
+
+} else {
+
+  cat(
+    "No season column detected.",
+    " Season will be derived from month.\n"
+  )
+
+}
+
+
+# =============================================================================
+# 6. STANDARDIZE IMPORTANT VARIABLES
+# =============================================================================
+
+all_data <- all_data %>%
+  mutate(
+
+    deer_id = as.character(
+      .data[[id_col]]
+    ),
+
+    datetime_original =
+      as.character(
+        .data[[datetime_col]]
+      )
+
+  )
+
+
+# -------------------------------------------------------------------------
+# Parse datetime
+# -------------------------------------------------------------------------
+
+all_data$datetime_std <- parse_date_time(
+  all_data$datetime_original,
+  orders = c(
+    "ymd HMS",
+    "ymd HM",
+    "mdy HMS",
+    "mdy HM",
+    "Ymd HMS",
+    "Ymd HM"
+  ),
+  tz = "UTC",
+  quiet = TRUE
+)
+
+
+cat("\nDatetime parsin<LOCAL_PATH>")
+cat(
+  "Valid datetime rows:",
+  sum(!is.na(all_data$datetime_std)),
+  "\n"
+)
+
+cat(
+  "Invalid datetime rows:",
+  sum(is.na(all_data$datetime_std)),
+  "\n"
+)
+
+
+# =============================================================================
+# 7. ADD DATE, MONTH, AND SEASON
+# =============================================================================
+
+all_data <- all_data %>%
+  mutate(
+
+    fix_date =
+      as.Date(datetime_std),
+
+    month =
+      month(
+        datetime_std,
+        label = TRUE,
+        abbr = TRUE
+      ),
+
+    month_number =
+      month(datetime_std)
+
+  )
+
+
+# -------------------------------------------------------------------------
+# Use existing season if present.
+# Otherwise derive meteorological season.
+# -------------------------------------------------------------------------
+
+if (!is.na(season_col)) {
+
+  all_data <- all_data %>%
+    mutate(
+      season_std =
+        as.character(
+          .data[[season_col]]
+        )
+    )
+
+} else {
+
+  all_data <- all_data %>%
+    mutate(
+
+      season_std =
+        case_when(
+
+          month_number %in% c(12, 1, 2) ~ "Winter",
+
+          month_number %in% c(3, 4, 5) ~ "Spring",
+
+          month_number %in% c(6, 7, 8) ~ "Summer",
+
+          month_number %in% c(9, 10, 11) ~ "Fall",
+
+          TRUE ~ NA_character_
+
+        )
+    )
+
+}
+
+
+# =============================================================================
+# 8. EXAMINE DOP FILTERING
+# =============================================================================
+
+data_before_dop <- all_data %>%
+  filter(
+    !is.na(deer_id),
+    !is.na(datetime_std)
+  )
+
+
+if (!is.na(dop_col)) {
+
+  data_before_dop <- data_before_dop %>%
+    mutate(
+      dop_std =
+        suppressWarnings(
+          as.numeric(
+            .data[[dop_col]]
+          )
+        )
+    )
+
+
+  cat("\n============================================================\n")
+  cat("DOP FILTER SUMMARY\n")
+  cat("============================================================\n")
+
+  cat(
+    "\nRows before DOP filter:",
+    nrow(data_before_dop),
+    "\n"
+  )
+
+  cat(
+    "Rows with DOP > 10:",
+    sum(
+      data_before_dop$dop_std > 10,
+      na.rm = TRUE
+    ),
+    "\n"
+  )
+
+  cat(
+    "Rows with missing DOP:",
+    sum(
+      is.na(data_before_dop$dop_std)
+    ),
+    "\n"
+  )
+
+
+  # Manuscript states locations with DOP > 10 were removed.
+  # Missing DOP values are retained here rather than automatically discarded.
+
+  data_after_dop <- data_before_dop %>%
+    filter(
+      is.na(dop_std) |
+        dop_std <= 10
+    )
+
+} else {
+
+  data_after_dop <- data_before_dop
+
+}
+
+
+cat(
+  "\nRows available after DOP filtering:",
+  nrow(data_after_dop),
+  "\n"
+)
+
+
+# =============================================================================
+# 9. COUNT GPS FIXES PER DEER PER DAY
+# =============================================================================
+
+daily_fixes <- data_after_dop %>%
+
+  group_by(
+    cwd_group,
+    deer_id,
+    fix_date
+  ) %>%
+
+  summarise(
+
+    n_fixes =
+      n_distinct(datetime_std),
+
+    season =
+      first(
+        season_std[
+          !is.na(season_std)
+        ],
+        default = NA_character_
+      ),
+
+    month =
+      first(
+        as.character(
+          month[
+            !is.na(month)
+          ]
+        ),
+        default = NA_character_
+      ),
+
+    .groups = "drop"
+
+  )
+
+
+cat("\n============================================================\n")
+cat("DAILY FIX COUNTS\n")
+cat("============================================================\n")
+
+cat(
+  "\nNumber of deer-days:",
+  nrow(daily_fixes),
+  "\n"
+)
+
+cat(
+  "Mean fixes per deer-day:",
+  round(
+    mean(daily_fixes$n_fixes),
+    2
+  ),
+  "\n"
+)
+
+cat(
+  "Median fixes per deer-day:",
+  median(daily_fixes$n_fixes),
+  "\n"
+)
+
+
+# =============================================================================
+# 10. OVERALL FIX-COUNT DISTRIBUTION
+# =============================================================================
+
+fix_distribution <- daily_fixes %>%
+
+  mutate(
+
+    fix_category =
+      case_when(
+
+        n_fixes >= 8 ~ "8+",
+
+        n_fixes == 7 ~ "7",
+
+        n_fixes == 6 ~ "6",
+
+        n_fixes == 5 ~ "5",
+
+        n_fixes == 4 ~ "4",
+
+        n_fixes == 3 ~ "3",
+
+        n_fixes == 2 ~ "2",
+
+        n_fixes == 1 ~ "1",
+
+        TRUE ~ "0"
+
+      )
+
+  ) %>%
+
+  count(
+    fix_category,
+    name = "deer_days"
+  ) %>%
+
+  mutate(
+
+    percent =
+      100 *
+      deer_days /
+      sum(deer_days)
+
+  )
+
+
+# Put categories in meaningful order
+
+fix_distribution <- fix_distribution %>%
+  mutate(
+
+    fix_category =
+      factor(
+        fix_category,
+        levels = c(
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8+"
+        )
+      )
+
+  ) %>%
+  arrange(
+    fix_category
+  )
+
+
+cat("\n============================================================\n")
+cat("OVERALL FIX DISTRIBUTION\n")
+cat("============================================================\n\n")
+
+print(
+  fix_distribution
+)
+
+
+# =============================================================================
+# 11. DIRECT ANSWER TO STEPHANIE'S QUESTION
+# =============================================================================
+
+reviewer_summary <- daily_fixes %>%
+
+  summarise(
+
+    total_deer_days =
+      n(),
+
+    days_8plus =
+      sum(n_fixes >= 8),
+
+    pct_8plus =
+      100 * mean(n_fixes >= 8),
+
+    days_7 =
+      sum(n_fixes == 7),
+
+    pct_7 =
+      100 * mean(n_fixes == 7),
+
+    days_6 =
+      sum(n_fixes == 6),
+
+    pct_6 =
+      100 * mean(n_fixes == 6),
+
+    days_5 =
+      sum(n_fixes == 5),
+
+    pct_5 =
+      100 * mean(n_fixes == 5),
+
+    days_4 =
+      sum(n_fixes == 4),
+
+    pct_4 =
+      100 * mean(n_fixes == 4),
+
+    days_3 =
+      sum(n_fixes == 3),
+
+    pct_3 =
+      100 * mean(n_fixes == 3),
+
+    days_below_4 =
+      sum(n_fixes < 4),
+
+    pct_below_4 =
+      100 * mean(n_fixes < 4)
+
+  )
+
+
+cat("\n============================================================\n")
+cat("REVIEWER-FOCUSED SUMMARY\n")
+cat("============================================================\n\n")
+
+print(
+  reviewer_summary,
+  width = Inf
+)
+
+
+# =============================================================================
+# 12. FIX SUCCESS BY INDIVIDUAL DEER
+# =============================================================================
+
+deer_summary <- daily_fixes %>%
+
+  group_by(
+    cwd_group,
+    deer_id
+  ) %>%
+
+  summarise(
+
+    n_days =
+      n(),
+
+    mean_fixes =
+      mean(n_fixes),
+
+    median_fixes =
+      median(n_fixes),
+
+    minimum_fixes =
+      min(n_fixes),
+
+    maximum_fixes =
+      max(n_fixes),
+
+    pct_8plus =
+      100 * mean(n_fixes >= 8),
+
+    pct_7plus =
+      100 * mean(n_fixes >= 7),
+
+    pct_4 =
+      100 * mean(n_fixes == 4),
+
+    pct_3 =
+      100 * mean(n_fixes == 3),
+
+    pct_below_4 =
+      100 * mean(n_fixes < 4),
+
+    .groups = "drop"
+
+  ) %>%
+
+  arrange(
+    mean_fixes
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY DEER\n")
+cat("============================================================\n\n")
+
+print(
+  deer_summary,
+  n = Inf
+)
+
+
+# =============================================================================
+# 13. FIX SUCCESS BY CWD GROUP
+# =============================================================================
+
+cwd_summary <- daily_fixes %>%
+
+  group_by(
+    cwd_group
+  ) %>%
+
+  summarise(
+
+    deer_days =
+      n(),
+
+    unique_deer =
+      n_distinct(deer_id),
+
+    mean_fixes =
+      mean(n_fixes),
+
+    median_fixes =
+      median(n_fixes),
+
+    pct_8plus =
+      100 * mean(n_fixes >= 8),
+
+    pct_7plus =
+      100 * mean(n_fixes >= 7),
+
+    pct_4 =
+      100 * mean(n_fixes == 4),
+
+    pct_3 =
+      100 * mean(n_fixes == 3),
+
+    pct_below_4 =
+      100 * mean(n_fixes < 4),
+
+    .groups = "drop"
+
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY CWD GROUP\n")
+cat("============================================================\n\n")
+
+print(
+  cwd_summary,
+  width = Inf
+)
+
+
+# =============================================================================
+# 14. FIX SUCCESS BY SEASON
+# =============================================================================
+
+season_summary <- daily_fixes %>%
+
+  filter(
+    !is.na(season)
+  ) %>%
+
+  group_by(
+    season
+  ) %>%
+
+  summarise(
+
+    deer_days =
+      n(),
+
+    unique_deer =
+      n_distinct(deer_id),
+
+    mean_fixes =
+      mean(n_fixes),
+
+    median_fixes =
+      median(n_fixes),
+
+    pct_8plus =
+      100 * mean(n_fixes >= 8),
+
+    pct_7plus =
+      100 * mean(n_fixes >= 7),
+
+    pct_4 =
+      100 * mean(n_fixes == 4),
+
+    pct_3 =
+      100 * mean(n_fixes == 3),
+
+    pct_below_4 =
+      100 * mean(n_fixes < 4),
+
+    .groups = "drop"
+
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY SEASON\n")
+cat("============================================================\n\n")
+
+print(
+  season_summary,
+  width = Inf
+)
+
+
+# =============================================================================
+# 15. FIX SUCCESS BY MONTH
+# =============================================================================
+
+month_summary <- daily_fixes %>%
+
+  filter(
+    !is.na(month)
+  ) %>%
+
+  group_by(
+    month
+  ) %>%
+
+  summarise(
+
+    deer_days =
+      n(),
+
+    unique_deer =
+      n_distinct(deer_id),
+
+    mean_fixes =
+      mean(n_fixes),
+
+    median_fixes =
+      median(n_fixes),
+
+    pct_8plus =
+      100 * mean(n_fixes >= 8),
+
+    pct_4 =
+      100 * mean(n_fixes == 4),
+
+    pct_3 =
+      100 * mean(n_fixes == 3),
+
+    pct_below_4 =
+      100 * mean(n_fixes < 4),
+
+    .groups = "drop"
+
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY MONTH\n")
+cat("============================================================\n\n")
+
+print(
+  month_summary,
+  width = Inf
+)
+
+
+# =============================================================================
+# 16. COMPARE >=3 VS >=4 FIXES PER DAY
+# =============================================================================
+
+threshold_comparison <- daily_fixes %>%
+
+  group_by(
+    cwd_group,
+    deer_id
+  ) %>%
+
+  summarise(
+
+    total_observed_days =
+      n(),
+
+    days_ge_3 =
+      sum(n_fixes >= 3),
+
+    days_ge_4 =
+      sum(n_fixes >= 4),
+
+    lost_days_if_4_instead_of_3 =
+      days_ge_3 - days_ge_4,
+
+    pct_ge_3 =
+      100 * mean(n_fixes >= 3),
+
+    pct_ge_4 =
+      100 * mean(n_fixes >= 4),
+
+    eligible_20days_ge3 =
+      days_ge_3 >= MIN_DAYS,
+
+    eligible_20days_ge4 =
+      days_ge_4 >= MIN_DAYS,
+
+    .groups = "drop"
+
+  )
+
+
+cat("\n============================================================\n")
+cat(">=3 VS >=4 FIXES/DAY COMPARISON\n")
+cat("============================================================\n\n")
+
+print(
+  threshold_comparison,
+  n = Inf
+)
+
+
+# =============================================================================
+# 17. HOW MANY DEER WOULD BE RETAINED?
+# =============================================================================
+
+retention_summary <- threshold_comparison %>%
+
+  summarise(
+
+    total_deer =
+      n(),
+
+    retained_ge3 =
+      sum(eligible_20days_ge3),
+
+    retained_ge4 =
+      sum(eligible_20days_ge4),
+
+    deer_lost_using_ge4 =
+      retained_ge3 - retained_ge4
+
+  )
+
+
+cat("\n============================================================\n")
+cat("INDIVIDUAL RETENTION UNDER EACH RULE\n")
+cat("============================================================\n\n")
+
+print(
+  retention_summary,
+  width = Inf
+)
+
+
+# =============================================================================
+# 18. IDENTIFY DEER WHO CHANGE ELIGIBILITY
+# =============================================================================
+
+changed_eligibility <- threshold_comparison %>%
+
+  filter(
+    eligible_20days_ge3 !=
+      eligible_20days_ge4
+  )
+
+
+cat("\n============================================================\n")
+cat("DEER WHO CHANGE ELIGIBILITY UNDER >=3 VS >=4\n")
+cat("============================================================\n\n")
+
+if (nrow(changed_eligibility) == 0) {
+
+  cat(
+    "No deer change eligibility between the >=3 and >=4 rules.\n"
+  )
+
+} else {
+
+  print(
+    changed_eligibility,
+    n = Inf
+  )
+
+}
+
+
+# =============================================================================
+# 19. OPTIONAL: DAILY FIX DISTRIBUTION BY CWD GROUP
+# =============================================================================
+
+fix_distribution_cwd <- daily_fixes %>%
+
+  mutate(
+
+    fix_category =
+      case_when(
+
+        n_fixes >= 8 ~ "8+",
+
+        TRUE ~ as.character(n_fixes)
+
+      )
+
+  ) %>%
+
+  count(
+    cwd_group,
+    fix_category,
+    name = "deer_days"
+  ) %>%
+
+  group_by(
+    cwd_group
+  ) %>%
+
+  mutate(
+
+    percent =
+      100 *
+      deer_days /
+      sum(deer_days)
+
+  ) %>%
+
+  ungroup()
+
+
+# =============================================================================
+# 20. SAVE TABLES
+# =============================================================================
+
+write_csv(
+  daily_fixes,
+  file.path(
+    output_dir,
+    "daily_fix_counts.csv"
+  )
+)
+
+write_csv(
+  fix_distribution,
+  file.path(
+    output_dir,
+    "overall_fix_distribution.csv"
+  )
+)
+
+write_csv(
+  reviewer_summary,
+  file.path(
+    output_dir,
+    "reviewer_summary.csv"
+  )
+)
+
+write_csv(
+  deer_summary,
+  file.path(
+    output_dir,
+    "fix_success_by_deer.csv"
+  )
+)
+
+write_csv(
+  cwd_summary,
+  file.path(
+    output_dir,
+    "fix_success_by_CWD_group.csv"
+  )
+)
+
+write_csv(
+  season_summary,
+  file.path(
+    output_dir,
+    "fix_success_by_season.csv"
+  )
+)
+
+write_csv(
+  month_summary,
+  file.path(
+    output_dir,
+    "fix_success_by_month.csv"
+  )
+)
+
+write_csv(
+  threshold_comparison,
+  file.path(
+    output_dir,
+    "three_vs_four_fix_threshold.csv"
+  )
+)
+
+write_csv(
+  changed_eligibility,
+  file.path(
+    output_dir,
+    "deer_changing_eligibility.csv"
+  )
+)
+
+
+# =============================================================================
+# 21. PLOT: OVERALL DAILY FIX DISTRIBUTION
+# =============================================================================
+
+p1 <- ggplot(
+  fix_distribution,
+  aes(
+    x = fix_category,
+    y = percent
+  )
+) +
+
+  geom_col() +
+
+  theme_bw(
+    base_size = 13
+  ) +
+
+  labs(
+
+    title =
+      "Distribution of Daily GPS Fix Counts",
+
+    x =
+      "Usable GPS relocations per deer-day",
+
+    y =
+      "Percent of deer-days"
+
+  )
+
+
+print(p1)
+
+
+ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "daily_fix_distribution.png"
+    ),
+  plot = p1,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+
+# =============================================================================
+# 22. PLOT: FIX SUCCESS BY DEER
+# =============================================================================
+
+p2 <- ggplot(
+  deer_summary,
+  aes(
+    x = reorder(
+      deer_id,
+      mean_fixes
+    ),
+    y = mean_fixes
+  )
+) +
+
+  geom_point(
+    size = 2
+  ) +
+
+  geom_hline(
+    yintercept = EXPECTED_FIXES_PER_DAY,
+    linetype = "dashed"
+  ) +
+
+  coord_flip() +
+
+  theme_bw(
+    base_size = 12
+  ) +
+
+  labs(
+
+    title =
+      "Mean Daily GPS Fix Count by Deer",
+
+    x =
+      "Deer ID",
+
+    y =
+      "Mean usable fixes per day"
+
+  )
+
+
+print(p2)
+
+
+ggsave(
+  filename =
+    file.path(
+      output_dir,
+      "mean_daily_fixes_by_deer.png"
+    ),
+  plot = p2,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# =============================================================================
+# 23. PLOT: FIX SUCCESS BY SEASON
+# =============================================================================
+
+if (nrow(season_summary) > 0) {
+
+  p3 <- ggplot(
+    daily_fixes %>%
+      filter(
+        !is.na(season)
+      ),
+    aes(
+      x = season,
+      y = n_fixes
+    )
+  ) +
+
+    geom_boxplot() +
+
+    geom_hline(
+      yintercept =
+        EXPECTED_FIXES_PER_DAY,
+      linetype = "dashed"
+    ) +
+
+    theme_bw(
+      base_size = 13
+    ) +
+
+    labs(
+
+      title =
+        "Daily GPS Fix Counts by Season",
+
+      x =
+        "Season",
+
+      y =
+        "Usable fixes per deer-day"
+
+    )
+
+
+  print(p3)
+
+
+  ggsave(
+    filename =
+      file.path(
+        output_dir,
+        "daily_fixes_by_season.png"
+      ),
+    plot = p3,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+
+}
+
+
+# =============================================================================
+# 24. FINAL CONSOLE SUMMARY
+# =============================================================================
+
+cat("\n\n")
+cat("============================================================\n")
+cat("FINAL GPS FIX-SUCCESS SUMMARY\n")
+cat("============================================================\n")
+
+cat(
+  "\nExpected scheduled fixes per day:",
+  EXPECTED_FIXES_PER_DAY,
+  "\n"
+)
+
+cat(
+  "\nTotal deer-days examined:",
+  nrow(daily_fixes),
+  "\n"
+)
+
+cat(
+  "\nPercent with >=8 usable fixes:",
+  round(
+    100 * mean(
+      daily_fixes$n_fixes >= 8
+    ),
+    2
+  ),
+  "%\n"
+)
+
+cat(
+  "Percent with exactly 4 usable fixes:",
+  round(
+    100 * mean(
+      daily_fixes$n_fixes == 4
+    ),
+    2
+  ),
+  "%\n"
+)
+
+cat(
+  "Percent with exactly 3 usable fixes:",
+  round(
+    100 * mean(
+      daily_fixes$n_fixes == 3
+    ),
+    2
+  ),
+  "%\n"
+)
+
+cat(
+  "Percent with <4 usable fixes:",
+  round(
+    100 * mean(
+      daily_fixes$n_fixes < 4
+    ),
+    2
+  ),
+  "%\n"
+)
+
+cat(
+  "\nDeer retained with >=20 days at >=3 fixes/day:",
+  sum(
+    threshold_comparison$eligible_20days_ge3
+  ),
+  "\n"
+)
+
+cat(
+  "Deer retained with >=20 days at >=4 fixes/day:",
+  sum(
+    threshold_comparison$eligible_20days_ge4
+  ),
+  "\n"
+)
+
+cat(
+  "\nAll outputs saved t<LOCAL_PATH>",
+  output_dir,
+  "\n"
+)
+
+cat("============================================================\n")
+
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+# ============================================================
+# GPS FIX SUCCESS:
+# Expected schedule = 8 fixes/day
+#
+# Calculate proportion of deer-days containing:
+# 3/8, 4/8, 5/8, 6/8, 7/8, and 8/8 fixes
+#
+# IMPORTANT:
+# Run AFTER DOP > 10 has been removed
+# but BEFORE 3-hour regularization.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. Make sure datetime is recognized
+# ------------------------------------------------------------
+
+all_data <- all_data %>%
+  mutate(
+    datetime = as.POSIXct(datetime),
+    date = as.Date(datetime)
+  )
+
+
+# ------------------------------------------------------------
+# 2. Count observed fixes for each deer on each day
+# ------------------------------------------------------------
+
+daily_fix_counts <- all_data %>%
+  group_by(
+    id,
+    date
+  ) %>%
+  summarise(
+    n_fixes = n(),
+    season = first(season),
+    .groups = "drop"
+  )
+
+
+# ------------------------------------------------------------
+# 3. Check for unexpected counts
+#
+# Because the expected maximum is 8/day, first make sure there
+# are not duplicates or days containing >8 fixes.
+# ------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("CHECK DAILY FIX COUNTS\n")
+cat("============================================================\n\n")
+
+print(
+  daily_fix_counts %>%
+    count(n_fixes) %>%
+    arrange(n_fixes),
+  n = Inf
+)
+
+
+cat(
+  "\nDays with >8 fixes:",
+  sum(daily_fix_counts$n_fixes > 8),
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# 4. OVERALL proportion of days with 3/8 through 8/8 fixes
+# ------------------------------------------------------------
+
+overall_fix_success <- daily_fix_counts %>%
+  filter(
+    n_fixes >= 3,
+    n_fixes <= 8
+  ) %>%
+  count(
+    n_fixes,
+    name = "n_deer_days"
+  ) %>%
+  complete(
+    n_fixes = 3:8,
+    fill = list(n_deer_days = 0)
+  ) %>%
+  mutate(
+    total_deer_days_3_to_8 = sum(n_deer_days),
+    proportion = n_deer_days / total_deer_days_3_to_8,
+    percent = 100 * proportion,
+    fix_success = paste0(
+      n_fixes,
+      "/8"
+    )
+  ) %>%
+  select(
+    fix_success,
+    n_fixes,
+    n_deer_days,
+    proportion,
+    percent
+  )
+
+
+cat("\n============================================================\n")
+cat("OVERALL FIX SUCCESS: 3/8 THROUGH 8/8\n")
+cat("============================================================\n\n")
+
+print(
+  overall_fix_success,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 5. ALSO calculate percentages using ALL observed deer-days
+#
+# This is important because otherwise days with <3 fixes are
+# removed from the denominator.
+# ------------------------------------------------------------
+
+total_days <- nrow(daily_fix_counts)
+
+overall_all_days <- daily_fix_counts %>%
+  mutate(
+    fix_category = case_when(
+      n_fixes < 3  ~ "<3/8",
+      n_fixes == 3 ~ "3/8",
+      n_fixes == 4 ~ "4/8",
+      n_fixes == 5 ~ "5/8",
+      n_fixes == 6 ~ "6/8",
+      n_fixes == 7 ~ "7/8",
+      n_fixes == 8 ~ "8/8",
+      n_fixes > 8  ~ ">8/8"
+    )
+  ) %>%
+  count(
+    fix_category,
+    name = "n_deer_days"
+  ) %>%
+  mutate(
+    percent_all_days =
+      100 * n_deer_days / total_days
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS USING ALL DEER-DAYS AS DENOMINATOR\n")
+cat("============================================================\n\n")
+
+print(
+  overall_all_days,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 6. FIX SUCCESS BY INDIVIDUAL DEER
+#
+# This directly answers:
+# "Did certain deer have better fix success?"
+# ------------------------------------------------------------
+
+fix_success_by_deer <- daily_fix_counts %>%
+  filter(
+    n_fixes >= 3,
+    n_fixes <= 8
+  ) %>%
+  mutate(
+    fix_success = paste0(
+      n_fixes,
+      "/8"
+    )
+  ) %>%
+  count(
+    id,
+    fix_success,
+    name = "n_days"
+  ) %>%
+  group_by(id) %>%
+  mutate(
+    total_days = sum(n_days),
+    percent = 100 * n_days / total_days
+  ) %>%
+  ungroup() %>%
+  arrange(
+    id,
+    fix_success
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY INDIVIDUAL DEER\n")
+cat("============================================================\n\n")
+
+print(
+  fix_success_by_deer,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 7. Simpler deer-level summary
+#
+# Especially useful for identifying deer with poorer fix success.
+# ------------------------------------------------------------
+
+deer_summary <- daily_fix_counts %>%
+  group_by(id) %>%
+  summarise(
+
+    total_days = n(),
+
+    mean_fixes_per_day =
+      mean(n_fixes),
+
+    median_fixes_per_day =
+      median(n_fixes),
+
+    pct_8_of_8 =
+      100 * mean(n_fixes == 8),
+
+    pct_7_of_8 =
+      100 * mean(n_fixes == 7),
+
+    pct_6_of_8 =
+      100 * mean(n_fixes == 6),
+
+    pct_5_of_8 =
+      100 * mean(n_fixes == 5),
+
+    pct_4_of_8 =
+      100 * mean(n_fixes == 4),
+
+    pct_3_of_8 =
+      100 * mean(n_fixes == 3),
+
+    pct_less_than_3 =
+      100 * mean(n_fixes < 3),
+
+    .groups = "drop"
+
+  ) %>%
+  arrange(
+    mean_fixes_per_day
+  )
+
+
+cat("\n============================================================\n")
+cat("DEER-LEVEL FIX SUCCESS SUMMARY\n")
+cat("============================================================\n\n")
+
+print(
+  deer_summary,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 8. FIX SUCCESS BY SEASON
+#
+# This directly answers:
+# "Did fix success differ at different times of the year?"
+# ------------------------------------------------------------
+
+fix_success_by_season <- daily_fix_counts %>%
+  filter(
+    !is.na(season),
+    n_fixes >= 3,
+    n_fixes <= 8
+  ) %>%
+  mutate(
+    fix_success = paste0(
+      n_fixes,
+      "/8"
+    )
+  ) %>%
+  count(
+    season,
+    fix_success,
+    name = "n_deer_days"
+  ) %>%
+  group_by(season) %>%
+  mutate(
+    total_deer_days = sum(n_deer_days),
+    percent = 100 * n_deer_days / total_deer_days
+  ) %>%
+  ungroup()
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY SEASON\n")
+cat("============================================================\n\n")
+
+print(
+  fix_success_by_season,
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 9. OPTIONAL: monthly analysis
+#
+# This is even more detailed than season and can identify
+# particular times of year with reduced GPS performance.
+# ------------------------------------------------------------
+
+daily_fix_counts <- daily_fix_counts %>%
+  mutate(
+    month = month(
+      date,
+      label = TRUE,
+      abbr = TRUE
+    )
+  )
+
+
+fix_success_by_month <- daily_fix_counts %>%
+  filter(
+    n_fixes >= 3,
+    n_fixes <= 8
+  ) %>%
+  mutate(
+    fix_success = paste0(
+      n_fixes,
+      "/8"
+    )
+  ) %>%
+  count(
+    month,
+    fix_success,
+    name = "n_deer_days"
+  ) %>%
+  group_by(month) %>%
+  mutate(
+    total_deer_days = sum(n_deer_days),
+    percent = 100 * n_deer_days / total_deer_days
+  ) %>%
+  ungroup()
+
+
+cat("\n============================================================\n")
+cat("FIX SUCCESS BY MONTH\n")
+cat("============================================================\n\n")
+
+print(
+  fix_success_by_month,
+  n = Inf
+)
+
+# Days with fewer than 3 fixes
+low_fix_days <- daily_fix_counts %>%
+  filter(n_fixes < 3)
+
+cat("Number of deer-days with <3 fixes:", nrow(low_fix_days), "\n")
+
+print(low_fix_days, n = 50)
+```
+
+```{r}
+# ============================================================
+# DIAGNOSE WHY DAYS WITH <3 ROWS EXIST
+# ============================================================
+
+library(dplyr)
+library(lubridate)
+
+# daily_fix_counts should already contain:
+# id, date, n_fixes
+#
+# all_data should contain the rows used to create it.
+
+
+# ------------------------------------------------------------
+# 1. Get first and last date for every deer
+# ------------------------------------------------------------
+
+deer_date_ranges <- daily_fix_counts %>%
+  group_by(id) %>%
+  summarise(
+    first_date = min(date, na.rm = TRUE),
+    last_date  = max(date, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# ------------------------------------------------------------
+# 2. Identify all days with <3 rows
+# ------------------------------------------------------------
+
+low_fix_days <- daily_fix_counts %>%
+  filter(n_fixes < 3) %>%
+  left_join(
+    deer_date_ranges,
+    by = "id"
+  ) %>%
+  mutate(
+    is_first_day = date == first_date,
+    is_last_day  = date == last_date,
+    boundary_day = is_first_day | is_last_day
+  )
+
+
+cat("\n============================================================\n")
+cat("LOW-FIX DAY DIAGNOSTIC\n")
+cat("============================================================\n")
+
+cat(
+  "\nTotal days with <3 rows:",
+  nrow(low_fix_days),
+  "\n"
+)
+
+cat(
+  "First tracking days:",
+  sum(low_fix_days$is_first_day),
+  "\n"
+)
+
+cat(
+  "Last tracking days:",
+  sum(low_fix_days$is_last_day),
+  "\n"
+)
+
+cat(
+  "Either first or last day:",
+  sum(low_fix_days$boundary_day),
+  "\n"
+)
+
+cat(
+  "Internal days with <3 rows:",
+  sum(!low_fix_days$boundary_day),
+  "\n"
+)
+
+cat(
+  "\nPercent of <3-row days that are tracking boundaries:",
+  round(
+    100 * mean(low_fix_days$boundary_day),
+    2
+  ),
+  "%\n"
+)
+
+
+# ------------------------------------------------------------
+# 3. Show distribution: 1 row vs 2 rows
+# ------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("1-ROW VS 2-ROW DAYS\n")
+cat("============================================================\n\n")
+
+print(
+  low_fix_days %>%
+    count(n_fixes) %>%
+    mutate(
+      percent = 100 * n / sum(n)
+    )
+)
+
+
+# ------------------------------------------------------------
+# 4. Which deer have these days?
+# ------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("LOW-FIX DAYS BY DEER\n")
+cat("============================================================\n\n")
+
+print(
+  low_fix_days %>%
+    count(
+      id,
+      name = "n_low_fix_days"
+    ) %>%
+    arrange(
+      desc(n_low_fix_days)
+    ),
+  n = Inf
+)
+
+
+# ------------------------------------------------------------
+# 5. Show the actual problematic dates
+# ------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("EXAMPLE LOW-FIX DAYS\n")
+cat("============================================================\n\n")
+
+print(
+  low_fix_days %>%
+    arrange(
+      id,
+      date
+    ) %>%
+    select(
+      id,
+      date,
+      n_fixes,
+      first_date,
+      last_date,
+      is_first_day,
+      is_last_day
+    ),
+  n = 100
+)
+
+
+# ------------------------------------------------------------
+# 6. CRITICAL:
+# Look at the actual timestamps on those days
+# ------------------------------------------------------------
+
+low_day_rows <- all_data %>%
+  inner_join(
+    low_fix_days %>%
+      select(
+        id,
+        date
+      ),
+    by = c(
+      "id",
+      "date"
+    )
+  ) %>%
+  arrange(
+    id,
+    date,
+    datetime
+  )
+
+
+cat("\n============================================================\n")
+cat("ACTUAL ROWS ON LOW-FIX DAYS\n")
+cat("============================================================\n\n")
+
+print(
+  low_day_rows %>%
+    select(
+      id,
+      date,
+      datetime,
+      everything()
+    ),
+  n = 100
+)
+
+```
+
+
+```{r}
+# ============================================================
+# CONFIRM EFFECT OF DOP FILTERING ON DAILY GPS FIX SUCCESS
+#
+# Goal:
+#   Compare number of GPS relocations per deer-day:
+#
+#   BEFORE DOP filtering
+#        vs.
+#   AFTER keeping only DOP < 10
+#
+# This directly tests whether DOP filtering created the
+# deer-days with fewer than 3 remaining relocations.
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+
+# ============================================================
+# 1. READ ORIGINAL GPS DATA
+# ============================================================
+
+file_path <- "<LOCAL_PATH>"
+
+deer_raw <- read_excel(
+  file_path,
+  sheet = 1,
+  .name_repair = "unique"
+)
+
+
+cat("\n============================================================\n")
+cat("RAW DATA\n")
+cat("============================================================\n")
+
+cat("Rows:", nrow(deer_raw), "\n")
+cat("Unique deer:", n_distinct(deer_raw$AID), "\n")
+
+print(names(deer_raw))
+
+
+# ============================================================
+# 2. RECREATE EARLY CLEANING FROM ORIGINAL PREPROCESSING
+#
+# Original preprocessing removed missing coordinates BEFORE
+# applying the DOP criterion.
+# ============================================================
+
+deer_clean <- deer_raw %>%
+  filter(
+    !is.na(Latitude),
+    !is.na(Longitude)
+  ) %>%
+  mutate(
+    AID = as.character(AID),
+
+    DOP = as.numeric(DOP),
+
+    datetime = as.POSIXct(
+      Date_Time,
+      format = "%m/%d/%Y %H:%M"
+    ),
+
+    date = as.Date(datetime)
+  ) %>%
+  filter(
+    !is.na(AID),
+    !is.na(datetime)
+  )
+
+
+cat("\nRows after removing missing coordinates:",
+    nrow(deer_clean), "\n")
+
+
+# ============================================================
+# 3. COUNT FIXES/DAY BEFORE DOP FILTERING
+# ============================================================
+
+before_dop <- deer_clean %>%
+  group_by(
+    AID,
+    date
+  ) %>%
+  summarise(
+    fixes_before = n_distinct(datetime),
+    .groups = "drop"
+  )
+
+
+# ============================================================
+# 4. APPLY EXACT DOP FILTER USED IN PREPROCESSING
+#
+# Your original code was:
+#
+#     filter(DOP < 10)
+#
+# Therefore DOP >= 10 is removed.
+# ============================================================
+
+deer_after_dop <- deer_clean %>%
+  filter(
+    DOP < 10
+  )
+
+
+after_dop <- deer_after_dop %>%
+  group_by(
+    AID,
+    date
+  ) %>%
+  summarise(
+    fixes_after = n_distinct(datetime),
+    .groups = "drop"
+  )
+
+
+# ============================================================
+# 5. JOIN BEFORE AND AFTER
+#
+# A day that completely disappears after DOP filtering should
+# have fixes_after = 0.
+# ============================================================
+
+daily_comparison <- before_dop %>%
+  left_join(
+    after_dop,
+    by = c("AID", "date")
+  ) %>%
+  mutate(
+    fixes_after = replace_na(fixes_after, 0L),
+
+    fixes_removed =
+      fixes_before - fixes_after,
+
+    pct_fixes_retained =
+      100 * fixes_after / fixes_before
+  )
+
+
+# ============================================================
+# 6. BASIC CHECK
+# ============================================================
+
+cat("\n============================================================\n")
+cat("DAILY GPS FIX COUNTS BEFORE VS AFTER DOP FILTERING\n")
+cat("============================================================\n")
+
+cat("\nTotal deer-days:", nrow(daily_comparison), "\n")
+
+cat(
+  "Days losing >=1 fix because of DOP:",
+  sum(daily_comparison$fixes_removed > 0),
+  "\n"
+)
+
+cat(
+  "Percent of days losing >=1 fix:",
+  round(
+    100 * mean(daily_comparison$fixes_removed > 0),
+    2
+  ),
+  "%\n"
+)
+
+cat(
+  "Total GPS fixes removed by DOP filter:",
+  sum(daily_comparison$fixes_removed),
+  "\n"
+)
+
+
+# ============================================================
+# 7. CRITICAL QUESTION:
+# HOW MANY DAYS HAVE <3 FIXES AFTER DOP FILTERING?
+# ============================================================
+
+cat("\n============================================================\n")
+cat("DAYS WITH <3 FIXES AFTER DOP FILTERING\n")
+cat("============================================================\n")
+
+low_after_dop <- daily_comparison %>%
+  filter(
+    fixes_after < 3
+  )
+
+
+cat(
+  "\nNumber of days with <3 fixes after DOP filtering:",
+  nrow(low_after_dop),
+  "\n"
+)
+
+cat(
+  "Percent of all deer-days:",
+  round(
+    100 * nrow(low_after_dop) / nrow(daily_comparison),
+    2
+  ),
+  "%\n"
+)
+
+
+# ============================================================
+# 8. WERE THOSE DAYS >=3 BEFORE DOP FILTERING?
+#
+# THIS IS THE BIG TEST.
+# ============================================================
+
+low_day_origin <- low_after_dop %>%
+  mutate(
+
+    had_at_least_3_before =
+      fixes_before >= 3,
+
+    dropped_below_3_due_to_dop =
+      fixes_before >= 3 &
+      fixes_after < 3
+
+  )
+
+
+cat("\n============================================================\n")
+cat("DID DOP FILTERING CREATE THE <3-FIX DAYS?\n")
+cat("============================================================\n")
+
+cat(
+  "\n<3-fix days that originally had >=3 fixes:",
+  sum(low_day_origin$dropped_below_3_due_to_dop),
+  "\n"
+)
+
+cat(
+  "Percent of <3-fix days explained by DOP filtering:",
+  round(
+    100 *
+      mean(
+        low_day_origin$dropped_below_3_due_to_dop
+      ),
+    2
+  ),
+  "%\n"
+)
+
+
+# ============================================================
+# 9. EXACT BEFORE -> AFTER TRANSITIONS
+#
+# This is probably the most useful table.
+#
+# Examples:
+#
+#   8 -> 8
+#   8 -> 7
+#   8 -> 6
+#   ...
+#   8 -> 2
+#   8 -> 1
+# ============================================================
+
+transition_table <- daily_comparison %>%
+  count(
+    fixes_before,
+    fixes_after,
+    name = "n_deer_days"
+  ) %>%
+  group_by(
+    fixes_before
+  ) %>%
+  mutate(
+    percent_within_before =
+      100 * n_deer_days / sum(n_deer_days)
+  ) %>%
+  ungroup() %>%
+  arrange(
+    fixes_before,
+    desc(fixes_after)
+  )
+
+
+cat("\n============================================================\n")
+cat("FIX COUNT TRANSITIONS: BEFORE -> AFTER DOP\n")
+cat("============================================================\n\n")
+
+print(
+  transition_table,
+  n = Inf
+)
+
+
+# ============================================================
+# 10. SPECIFICALLY EXAMINE DAYS THAT STARTED WITH 8 FIXES
+# ============================================================
+
+eight_fix_days <- daily_comparison %>%
+  filter(
+    fixes_before == 8
+  ) %>%
+  count(
+    fixes_after,
+    name = "n_deer_days"
+  ) %>%
+  complete(
+    fixes_after = 0:8,
+    fill = list(
+      n_deer_days = 0
+    )
+  ) %>%
+  mutate(
+    percent =
+      100 *
+      n_deer_days /
+      sum(n_deer_days),
+
+    category =
+      paste0(
+        fixes_after,
+        "/8"
+      )
+  ) %>%
+  arrange(
+    fixes_after
+  )
+
+
+cat("\n============================================================\n")
+cat("DAYS THAT ORIGINALLY HAD 8/8 FIXES\n")
+cat("============================================================\n\n")
+
+print(
+  eight_fix_days,
+  n = Inf
+)
+
+
+# ============================================================
+# 11. DISTRIBUTION BEFORE DOP
+# ============================================================
+
+before_distribution <- before_dop %>%
+  count(
+    fixes_before,
+    name = "n_deer_days"
+  ) %>%
+  mutate(
+    percent =
+      100 *
+      n_deer_days /
+      sum(n_deer_days)
+  )
+
+
+cat("\n============================================================\n")
+cat("DAILY FIX DISTRIBUTION BEFORE DOP FILTERING\n")
+cat("============================================================\n\n")
+
+print(
+  before_distribution,
+  n = Inf
+)
+
+
+# ============================================================
+# 12. DISTRIBUTION AFTER DOP
+# ============================================================
+
+after_distribution <- daily_comparison %>%
+  count(
+    fixes_after,
+    name = "n_deer_days"
+  ) %>%
+  mutate(
+    percent =
+      100 *
+      n_deer_days /
+      sum(n_deer_days)
+  )
+
+
+cat("\n============================================================\n")
+cat("DAILY FIX DISTRIBUTION AFTER DOP FILTERING\n")
+cat("============================================================\n\n")
+
+print(
+  after_distribution,
+  n = Inf
+)
+
+
+# ============================================================
+# 13. LOOK SPECIFICALLY AT THE PROBLEMATIC DAYS
+# ============================================================
+
+problem_days <- daily_comparison %>%
+  filter(
+    fixes_after < 3
+  ) %>%
+  arrange(
+    fixes_after,
+    desc(fixes_before)
+  )
+
+
+cat("\n============================================================\n")
+cat("ALL DAYS WITH <3 FIXES AFTER DOP FILTERING\n")
+cat("============================================================\n\n")
+
+print(
+  problem_days,
+  n = Inf
+)
+
+
+# ============================================================
+# 14. SUMMARY BY DEER
+#
+# Determine whether certain deer were disproportionately
+# affected by poor DOP.
+# ============================================================
+
+dop_by_deer <- daily_comparison %>%
+  group_by(
+    AID
+  ) %>%
+  summarise(
+
+    n_days =
+      n(),
+
+    fixes_before =
+      sum(fixes_before),
+
+    fixes_after =
+      sum(fixes_after),
+
+    fixes_removed =
+      sum(fixes_removed),
+
+    pct_removed =
+      100 *
+      fixes_removed /
+      fixes_before,
+
+    days_below_3_after =
+      sum(fixes_after < 3),
+
+    pct_days_below_3_after =
+      100 *
+      mean(fixes_after < 3),
+
+    .groups = "drop"
+
+  ) %>%
+  arrange(
+    desc(pct_days_below_3_after)
+  )
+
+
+cat("\n============================================================\n")
+cat("DOP EFFECT BY DEER\n")
+cat("============================================================\n\n")
+
+print(
+  dop_by_deer,
+  n = Inf
+)
+
+```
+
+
+```{r}
+# ============================================================
+# DAYS THAT FELL BELOW 3 FIXES BECAUSE OF DOP FILTERING
+# ============================================================
+
+dropped_below_3 <- daily_comparison %>%
+  filter(
+    fixes_before >= 3,
+    fixes_after < 3
+  ) %>%
+  arrange(
+    fixes_before,
+    fixes_after
+  )
+
+cat("\nNumber pushed below 3 by DOP:",
+    nrow(dropped_below_3), "\n\n")
+
+print(
+  dropped_below_3 %>%
+    count(
+      fixes_before,
+      fixes_after,
+      name = "n_deer_days"
+    ) %>%
+    arrange(
+      fixes_before,
+      fixes_after
+    ),
+  n = Inf
+)
+```
+
+```{r}
+# ============================================================
+# TEST HYPOTHESIS:
+# Require >=3 original fixes/day BEFORE applying DOP < 10
+# ============================================================
+
+# 1. Identify days that originally had at least 3 fixes
+eligible_days_before_dop <- before_dop %>%
+  filter(fixes_before >= 3) %>%
+  select(AID, date)
+
+# 2. Restrict raw cleaned GPS data to those eligible days
+deer_ge3_before_dop <- deer_clean %>%
+  semi_join(
+    eligible_days_before_dop,
+    by = c("AID", "date")
+  )
+
+# 3. Now apply the actual DOP criterion
+deer_ge3_after_dop <- deer_ge3_before_dop %>%
+  filter(DOP < 10)
+
+# 4. Count remaining fixes per day
+ge3_then_dop <- eligible_days_before_dop %>%
+  left_join(
+    deer_ge3_after_dop %>%
+      group_by(AID, date) %>%
+      summarise(
+        fixes_after_dop = n_distinct(datetime),
+        .groups = "drop"
+      ),
+    by = c("AID", "date")
+  ) %>%
+  mutate(
+    fixes_after_dop = replace_na(fixes_after_dop, 0L)
+  )
+
+# 5. Distribution after BOTH rules
+distribution_ge3_then_dop <- ge3_then_dop %>%
+  count(
+    fixes_after_dop,
+    name = "n_deer_days"
+  ) %>%
+  mutate(
+    percent =
+      100 * n_deer_days / sum(n_deer_days)
+  )
+
+cat("\n============================================================\n")
+cat("IF >=3 FIXES WAS REQUIRED BEFORE DOP FILTERING\n")
+cat("============================================================\n\n")
+
+print(
+  distribution_ge3_then_dop,
+  n = Inf
+)
+
+cat(
+  "\nDays originally eligible (>=3 fixes):",
+  nrow(ge3_then_dop),
+  "\n"
+)
+
+cat(
+  "Eligible days subsequently falling below 3 after DOP:",
+  sum(ge3_then_dop$fixes_after_dop < 3),
+  "\n"
+)
+
+cat(
+  "Percent falling below 3 because of DOP:",
+  round(
+    100 * mean(ge3_then_dop$fixes_after_dop < 3),
+    3
+  ),
+  "%\n"
+)
+
+```
+
+
+### Final answer regarding pings
+```{r}
+library(dplyr)
+library(lubridate)
+
+# ============================================================
+# Ping-threshold sensitivity table
+#
+# Use this AFTER DOP filtering and after your final cleaned
+# telemetry dataset is created.
+# ============================================================
+
+# Update these if your column names differ
+id_col <- "id"
+datetime_col <- "date_time"
+
+# Replace all_data with the dataframe you are analyzing
+ping_data <- all_data %>%
+  mutate(
+    date_time_tmp = as.POSIXct(.data[[datetime_col]]),
+    date = as.Date(date_time_tmp)
+  ) %>%
+  filter(
+    !is.na(.data[[id_col]]),
+    !is.na(date)
+  )
+
+# ------------------------------------------------------------
+# Count pings per deer-day
+# ------------------------------------------------------------
+daily_ping_counts <- ping_data %>%
+  group_by(
+    id = .data[[id_col]],
+    date
+  ) %>%
+  summarise(
+    pings_per_day = n(),
+    .groups = "drop"
+  )
+
+total_deer_days <- nrow(daily_ping_counts)
+total_points <- sum(daily_ping_counts$pings_per_day)
+
+# ------------------------------------------------------------
+# Simple distribution table
+# ------------------------------------------------------------
+ping_distribution <- daily_ping_counts %>%
+  count(
+    pings_per_day,
+    name = "deer_days"
+  ) %>%
+  mutate(
+    percent_deer_days = round(deer_days / total_deer_days * 100, 2),
+    gps_points = pings_per_day * deer_days,
+    percent_gps_points = round(gps_points / total_points * 100, 2)
+  ) %>%
+  arrange(pings_per_day)
+
+print(ping_distribution)
+
+# ------------------------------------------------------------
+# Threshold sensitivity table
+# What would be dropped if we required at least N pings/day?
+# ------------------------------------------------------------
+threshold_table <- tibble(
+  minimum_required_pings_per_day = c(3, 4, 5, 6, 7, 8)
+) %>%
+  rowwise() %>%
+  mutate(
+    deer_days_dropped =
+      sum(daily_ping_counts$pings_per_day < minimum_required_pings_per_day),
+
+    percent_deer_days_dropped =
+      round(deer_days_dropped / total_deer_days * 100, 2),
+
+    gps_points_dropped =
+      sum(daily_ping_counts$pings_per_day[
+        daily_ping_counts$pings_per_day < minimum_required_pings_per_day
+      ]),
+
+    percent_gps_points_dropped =
+      round(gps_points_dropped / total_points * 100, 2),
+
+    deer_days_retained =
+      sum(daily_ping_counts$pings_per_day >= minimum_required_pings_per_day),
+
+    percent_deer_days_retained =
+      round(deer_days_retained / total_deer_days * 100, 2),
+
+    gps_points_retained =
+      sum(daily_ping_counts$pings_per_day[
+        daily_ping_counts$pings_per_day >= minimum_required_pings_per_day
+      ]),
+
+    percent_gps_points_retained =
+      round(gps_points_retained / total_points * 100, 2)
+  ) %>%
+  ungroup()
+
+print(threshold_table)
+```
