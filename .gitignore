@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Data and model artifacts
+data/raw/
+data/interim/
+data/processed/
+outputs/
+models/
+*.h5
+*.keras
+*.pkl
+*.joblib
+*.rds
+
+# Notebooks and local checkpoints
+.ipynb_checkpoints/
+
+# Local/system files
+.DS_Store
+__MACOSX/
+._*
