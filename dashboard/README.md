@@ -12,6 +12,11 @@ It uses synthetic telemetry by default and is intended to demonstrate:
 - retained fixes by animal and day;
 - movement-feature distributions.
 
+The sidebar controls are active model controls:
+
+- the threshold percentile changes the reconstruction-error cutoff and row-level flags;
+- the minimum anomalous-fixes rule changes animal-level calls.
+
 Run from the repository root:
 
 ```bash
