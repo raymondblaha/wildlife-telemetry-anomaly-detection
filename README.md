@@ -13,6 +13,10 @@ results at both the GPS-fix and animal levels.
 Raw GPS coordinates, exact animal IDs, agency file paths, and unpublished split manifests
 are intentionally excluded.
 
+The runnable public demo, generated sample files, and dashboard use synthetic,
+manuscript-shaped telemetry data. They are designed to demonstrate the workflow without
+exposing protected collaborator GPS data.
+
 ## Research Context
 
 The mule deer anomaly-detection pipeline represented in this repository was developed to
